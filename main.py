@@ -86,7 +86,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     K: int = datasets_params[args.dataset]['K']
     kernels: int = datasets_params[args.dataset]['kernels'] if 'kernels' in datasets_params[args.dataset] else 8
     factor: int = datasets_params[args.dataset]['factor'] if 'factor' in datasets_params[args.dataset] else 2
-    net = datasets_params[args.dataset]['net'](1, K, kernels=kernels, factor=factor)
+    net = datasets_params[args.dataset]['net'](args.context, K, kernels=kernels, factor=factor)
     net.init_weights()
     net.to(device)
 
@@ -103,7 +103,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
                              root_dir,
                              img_transform=img_transform,
                              gt_transform= partial(gt_transform, K),
-                             debug=args.debug)
+                             debug=args.debug,
+                             context=args.context)
     train_loader = DataLoader(train_set,
                               batch_size=B,
                               num_workers=5,
@@ -113,7 +114,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
                            root_dir,
                            img_transform=img_transform,
                            gt_transform=partial(gt_transform, K),
-                           debug=args.debug)
+                           debug=args.debug,
+                           context=args.context)
     val_loader = DataLoader(val_set,
                             batch_size=B,
                             num_workers=5,
@@ -127,7 +129,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
 def runTraining(args):
     print(f">>> Setting up to train on {args.dataset} with {args.mode}")
     net, optimizer, device, train_loader, val_loader, K = setup(args)
-
+    
     if args.mode == "full":
         loss_fn = CrossEntropy(idk=list(range(K)))  # Supervise both background and foreground
     elif args.mode in ["partial"] and args.dataset == 'SEGTHOR':
@@ -245,7 +247,8 @@ def main():
     parser.add_argument('--debug', action='store_true',
                         help="Keep only a fraction (10 samples) of the datasets, "
                              "to test the logics around epochs and logging easily.")
-
+    parser.add_argument('--context', type=int, default=1,
+                        help="Context size for the 25D dataset.")
     args = parser.parse_args()
 
     pprint(args)
