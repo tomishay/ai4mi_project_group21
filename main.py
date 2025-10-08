@@ -30,6 +30,7 @@ from pprint import pprint
 from operator import itemgetter
 from shutil import copytree, rmtree
 
+import csv
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -243,6 +244,28 @@ def runTraining(args):
                         postfix_dict |= {f"Dice-{k}": f"{log_dice[e, :j, k].mean():05.3f}"
                                          for k in range(1, K)}
                     tq_iter.set_postfix(postfix_dict)
+        
+        csv_file = args.dest / "training_metrics.csv"
+
+    with open(csv_file, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        # Header
+        header = ["epoch", "train_loss", "val_loss", "train_dice", "val_dice"] + [f"train_dice_class{k}" for k in range(1, K)] + [f"val_dice_class{k}" for k in range(1, K)]
+        writer.writerow(header)
+
+        for e in range(args.epochs):
+            train_loss_mean = log_loss_tra[e].mean().item()
+            val_loss_mean = log_loss_val[e].mean().item()
+            train_dice_mean = log_dice_tra[e, :, 1:].mean().item()  # exclude background
+            val_dice_mean = log_dice_val[e, :, 1:].mean().item()
+            # Dice per class
+            train_dice_classes = [log_dice_tra[e, :, k].mean().item() for k in range(1, K)]
+            val_dice_classes = [log_dice_val[e, :, k].mean().item() for k in range(1, K)]
+
+            row = [e, train_loss_mean, val_loss_mean, train_dice_mean, val_dice_mean] + train_dice_classes + val_dice_classes
+            writer.writerow(row)
+
+        print(f">>> Metrics exported to {csv_file}")
 
         # I save it at each epochs, in case the code crashes or I decide to stop it early
         np.save(args.dest / "loss_tra.npy", log_loss_tra)
@@ -266,7 +289,6 @@ def runTraining(args):
             torch.save(net, args.dest / "bestmodel.pkl")
             torch.save(net.state_dict(), args.dest / "bestweights.pt")
 
-
 def main():
     parser = argparse.ArgumentParser()
 
@@ -284,12 +306,28 @@ def main():
     parser.add_argument('--debug', action='store_true',
                         help="Keep only a fraction (10 samples) of the datasets, "
                              "to test the logics around epochs and logging easily.")
+    
+    parser.add_argument('--n_runs', default=1, type=int,
+                    help="Number of times to repeat the training run for statistical comparison.")
 
     args = parser.parse_args()
 
     pprint(args)
 
-    runTraining(args)
+    for run_idx in range(args.n_runs):
+        print(f"\n============================")
+        print(f" Run {run_idx + 1}/{args.n_runs} ")
+        print(f"============================")
+
+        # Create a subfolder per run
+        run_dest = args.dest / f"run_{run_idx+1}"
+        run_dest.mkdir(parents=True, exist_ok=True)
+
+        # Pass updated destination to each run
+        args.dest = run_dest
+
+        runTraining(args)
+
 
 
 if __name__ == '__main__':
