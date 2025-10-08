@@ -51,6 +51,7 @@ from utils import (Dcm,
                    save_images)
 
 from losses import (CrossEntropy)
+from preprocess import run_preprocess
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
@@ -231,6 +232,18 @@ def runTraining(args):
             torch.save(net, args.dest / "bestmodel.pkl")
             torch.save(net.state_dict(), args.dest / "bestweights.pt")
 
+def preprocess(args):
+    src: Path = args.source_pre_processed
+    dst: Path = args.dest_pre_processed
+
+    spacing_dst = tuple(args.spacing) if args.spacing is not None else None
+    low, high = args.clip_percentiles
+    median_size3 = (int(args.median_size[0]), int(args.median_size[1]), int(args.median_size[2]))
+    target_shape = tuple(args.target_shape) if args.target_shape is not None else None
+
+    run_preprocess(src, dst, spacing_dst, low, high, median_size3, target_shape)
+
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -245,11 +258,23 @@ def main():
     parser.add_argument('--debug', action='store_true',
                         help="Keep only a fraction (10 samples) of the datasets, "
                              "to test the logics around epochs and logging easily.")
+    
+    
+
+    # Preprocessing
+    parser.add_argument("--source_pre_processed", type=Path, required=True)
+    parser.add_argument("--dest_pre_processed", type=Path, required=True)
+    parser.add_argument("--clip_percentiles", type=float, nargs=2, default=[0.5, 99.5])
+    parser.add_argument("--median_size", type=int, nargs="+", default=(0, 0, 0),
+                        help="Tuple of median size (x, x, x)")
+    parser.add_argument("--spacing", type=float, nargs=3, default=None)
+    parser.add_argument("--target_shape", type=int, nargs=3, default=None)
 
     args = parser.parse_args()
 
     pprint(args)
 
+    preprocess(args)
     runTraining(args)
 
 
