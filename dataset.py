@@ -66,6 +66,7 @@ def make_patient_to_indices(files: list[tuple[Path, Path | None]]) -> dict[str, 
 class SliceDataset(Dataset):
     def __init__(self, subset, root_dir, img_transform=None,
                  gt_transform=None, augment=False, equalize=False, debug=False, context=None):
+        assert context % 2 == 1, f"Context must be odd or None but got {context=}"
         self.root_dir: str = root_dir
         self.img_transform: Callable = img_transform
         self.gt_transform: Callable = gt_transform
@@ -112,15 +113,14 @@ class SliceDataset(Dataset):
                 for i in neighbour_global
             ]
         # stack into a single tensor of shape (C, H, W)
+        
         images = torch.cat(img_tensors, dim=0)
-        stems = [self.files[i][0].stem for i in neighbour_global]
-
-        data_dict = {"images": images, "stems": stems}
+        data_dict = {"images": images, "stems": img_path.stem}
 
         if not self.test_mode:
             gt: Tensor = self.gt_transform(Image.open(gt_path))
 
-            _, W, H = images[0].shape
+            _, W, H = images.shape
             K, _, _ = gt.shape
             assert gt.shape == (K, W, H)
 
