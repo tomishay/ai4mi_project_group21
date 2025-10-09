@@ -30,12 +30,21 @@ from pprint import pprint
 from operator import itemgetter
 from shutil import copytree, rmtree
 
+import csv
 import torch
 import numpy as np
 import torch.nn.functional as F
 from torch import nn, Tensor
 from torchvision import transforms
 from torch.utils.data import DataLoader
+
+from functools import partial
+
+from torch.optim import AdamW, SGD, Adam
+from torch.optim.lr_scheduler import OneCycleLR
+from lion_pytorch import Lion
+
+# ---------------------------------------------
 
 from dataset import SliceDataset
 from ShallowNet import shallowCNN
@@ -59,21 +68,36 @@ datasets_params["SEGTHOR"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor
 datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 
 
-def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
+def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
     # Networks and scheduler
     gpu: bool = args.gpu and torch.cuda.is_available()
     device = torch.device("cuda") if gpu else torch.device("cpu")
     print(f">> Picked {device} to run experiments")
 
     K: int = datasets_params[args.dataset]['K']
-    kernels: int = datasets_params[args.dataset]['kernels'] if 'kernels' in datasets_params[args.dataset] else 8
-    factor: int = datasets_params[args.dataset]['factor'] if 'factor' in datasets_params[args.dataset] else 2
+    kernels: int = datasets_params[args.dataset].get('kernels', 8)
+    factor: int = datasets_params[args.dataset].get('factor', 2)
     net = datasets_params[args.dataset]['net'](1, K, kernels=kernels, factor=factor)
     net.init_weights()
     net.to(device)
 
+    # --- Optimizer selection ---
     lr = 0.0005
-    optimizer = torch.optim.Adam(net.parameters(), lr=lr, betas=(0.9, 0.999))
+    optimizer_type = args.optimizer if hasattr(args, 'optimizer') else 'adamw'
+
+    if optimizer_type == 'adamw':
+        optimizer = AdamW(net.parameters(), lr=lr, betas=(0.9, 0.999))
+    elif optimizer_type == 'adam':
+        optimizer = Adam(net.parameters(), lr=lr, betas=(0.9, 0.999))
+    elif optimizer_type == 'radam':
+        from torch.optim import RAdam
+        optimizer = RAdam(net.parameters(), lr=lr)
+    elif optimizer_type == 'sgd':
+        optimizer = SGD(net.parameters(), lr=0.01, momentum=0.9, nesterov=True)
+    elif optimizer_type == 'lion':
+        optimizer = Lion(net.parameters(), lr=lr)
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_type}")
 
     # Dataset part
     B: int = datasets_params[args.dataset]['B']
@@ -120,12 +144,25 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
 
     args.dest.mkdir(parents=True, exist_ok=True)
 
-    return (net, optimizer, device, train_loader, val_loader, K)
+    # --- OneCycleLR Scheduler ---
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=lr * 10,       
+        steps_per_epoch=len(train_loader),
+        epochs=args.epochs,
+        pct_start=0.3,
+        anneal_strategy='cos',
+        div_factor=10,
+        final_div_factor=100
+    )
+
+    return (net, optimizer, scheduler, device, train_loader, val_loader, K)
 
 
 def runTraining(args):
-    print(f">>> Setting up to train on {args.dataset} with {args.mode}")
-    net, optimizer, device, train_loader, val_loader, K = setup(args)
+    print(f">>> Setting up to train on {args.dataset} with {args.mode} using {args.optimizer} optimizer")
+    # Updated setup function now returns the scheduler
+    net, optimizer, scheduler, device, train_loader, val_loader, K = setup(args)
 
     if args.loss_type == 'CrossEntropy':
         if args.mode == "full":
@@ -156,6 +193,7 @@ def runTraining(args):
                 case 'train':
                     net.train()
                     opt = optimizer
+                    sched = scheduler # Use the scheduler
                     cm = Dcm
                     desc = f">> Training   ({e: 4d})"
                     loader = train_loader
@@ -164,6 +202,7 @@ def runTraining(args):
                 case 'val':
                     net.eval()
                     opt = None
+                    sched = None # No scheduler update on validation
                     cm = torch.no_grad
                     desc = f">> Validation ({e: 4d})"
                     loader = val_loader
@@ -197,6 +236,7 @@ def runTraining(args):
                     if opt:  # Only for training
                         loss.backward()
                         opt.step()
+                        sched.step() # Step the scheduler after the optimizer step
 
                     if m == 'val':
                         with warnings.catch_warnings():
@@ -210,11 +250,33 @@ def runTraining(args):
                     j += B  # Keep in mind that _in theory_, each batch might have a different size
                     # For the DSC average: do not take the background class (0) into account:
                     postfix_dict: dict[str, str] = {"Dice": f"{log_dice[e, :j, 1:].mean():05.3f}",
-                                                    "Loss": f"{log_loss[e, :i + 1].mean():5.2e}"}
+                                                     "Loss": f"{log_loss[e, :i + 1].mean():5.2e}"}
                     if K > 2:
                         postfix_dict |= {f"Dice-{k}": f"{log_dice[e, :j, k].mean():05.3f}"
                                          for k in range(1, K)}
                     tq_iter.set_postfix(postfix_dict)
+        
+        csv_file = args.dest / "training_metrics.csv"
+
+    with open(csv_file, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        # Header
+        header = ["epoch", "train_loss", "val_loss", "train_dice", "val_dice"] + [f"train_dice_class{k}" for k in range(1, K)] + [f"val_dice_class{k}" for k in range(1, K)]
+        writer.writerow(header)
+
+        for e in range(args.epochs):
+            train_loss_mean = log_loss_tra[e].mean().item()
+            val_loss_mean = log_loss_val[e].mean().item()
+            train_dice_mean = log_dice_tra[e, :, 1:].mean().item()  # exclude background
+            val_dice_mean = log_dice_val[e, :, 1:].mean().item()
+            # Dice per class
+            train_dice_classes = [log_dice_tra[e, :, k].mean().item() for k in range(1, K)]
+            val_dice_classes = [log_dice_val[e, :, k].mean().item() for k in range(1, K)]
+
+            row = [e, train_loss_mean, val_loss_mean, train_dice_mean, val_dice_mean] + train_dice_classes + val_dice_classes
+            writer.writerow(row)
+
+        print(f">>> Metrics exported to {csv_file}")
 
         # I save it at each epochs, in case the code crashes or I decide to stop it early
         np.save(args.dest / "loss_tra.npy", log_loss_tra)
@@ -238,7 +300,6 @@ def runTraining(args):
             torch.save(net, args.dest / "bestmodel.pkl")
             torch.save(net.state_dict(), args.dest / "bestweights.pt")
 
-
 def main():
     parser = argparse.ArgumentParser()
 
@@ -249,16 +310,36 @@ def main():
     parser.add_argument('--dest', type=Path, required=True,
                         help="Destination directory to save the results (predictions and weights).")
 
+    optimizer_choices = ['adam','adamw', 'radam', 'sgd', 'lion']
+    parser.add_argument('--optimizer', default='adam', choices=optimizer_choices,
+                        help="The optimizer to use for training.")
+
     parser.add_argument('--gpu', action='store_true')
     parser.add_argument('--debug', action='store_true',
                         help="Keep only a fraction (10 samples) of the datasets, "
                              "to test the logics around epochs and logging easily.")
+    
+    parser.add_argument('--n_runs', default=1, type=int,
+                    help="Number of times to repeat the training run for statistical comparison.")
 
     args = parser.parse_args()
 
     pprint(args)
 
-    runTraining(args)
+    for run_idx in range(args.n_runs):
+        print(f"\n============================")
+        print(f" Run {run_idx + 1}/{args.n_runs} ")
+        print(f"============================")
+
+        # Create a subfolder per run
+        run_dest = args.dest / f"run_{run_idx+1}"
+        run_dest.mkdir(parents=True, exist_ok=True)
+
+        # Pass updated destination to each run
+        args.dest = run_dest
+
+        runTraining(args)
+
 
 
 if __name__ == '__main__':
