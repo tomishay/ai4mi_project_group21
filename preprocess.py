@@ -134,8 +134,7 @@ def preprocess_patient(
     clip_lo: float, clip_hi: float,
     do_clahe: bool, clahe_clip: float, clahe_grid: int,
     median_size: Tuple[int, int, int],
-    target_shape: Optional[tuple[int, int, int]] = None 
-    
+    target_shape: Optional[tuple[int, int, int]]
 ):
     
     out_dir.mkdir(parents=True, exist_ok=True)

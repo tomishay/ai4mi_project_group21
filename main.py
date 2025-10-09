@@ -265,10 +265,12 @@ def main():
     parser.add_argument("--source_pre_processed", type=Path, required=True)
     parser.add_argument("--dest_pre_processed", type=Path, required=True)
     parser.add_argument("--clip_percentiles", type=float, nargs=2, default=[0.5, 99.5])
-    parser.add_argument("--median_size", type=int, nargs="+", default=(0, 0, 0),
+    parser.add_argument("--median_size", type=int, nargs=3, default=(0, 0, 0),
                         help="Tuple of median size (x, x, x)")
     parser.add_argument("--spacing", type=float, nargs=3, default=None)
     parser.add_argument("--target_shape", type=int, nargs=3, default=None)
+    parser.add_argument("--do_norm", type=bool, default=False)
+    parser.add_argument("--do_clahe", type=bool, default=False)
 
     args = parser.parse_args()
 
