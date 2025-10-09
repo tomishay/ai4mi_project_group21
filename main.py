@@ -341,7 +341,7 @@ def main():
                         help="Number of folds for cross-validation; set >1 to enable.")
     parser.add_argument('--cv-index', type=int, default=0,
                         help="Fold index to train when cross-validation is enabled.")
-    parser.add_argument('--cv-run-all', action='store_true', default=True,
+    parser.add_argument('--cv-run-all', action='store_true',
                         help="Train sequentially on every fold when cross-validation is enabled.")
     parser.add_argument('--cv-seed', type=int, default=42,
                         help="Random seed used to shuffle samples before fold splits.")
@@ -358,7 +358,7 @@ def main():
     base_dest = args.dest
 
     if use_crossval:
-        if args.cv_run_all:
+        if args.cv_run_all :
             summaries: list[dict[str, Any]] = []
             for fold_idx in range(args.cv_folds):
                 fold_args = argparse.Namespace(**vars(args))
