@@ -58,6 +58,7 @@ from utils import (Dcm,
                    save_images)
 
 from losses import (CrossEntropy)
+from new_losses import (CombinedLoss)
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
@@ -66,23 +67,6 @@ datasets_params["TOY2"] = {'K': 2, 'net': shallowCNN, 'B': 2, 'kernels': 8, 'fac
 datasets_params["SEGTHOR"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 
-def img_transform(img):
-        img = img.convert('L')
-        img = np.array(img)[np.newaxis, ...]
-        img = img / 255  # max <= 1
-        img = torch.tensor(img, dtype=torch.float32)
-        return img
-
-def gt_transform(K, img):
-        img = np.array(img)[...]
-        # The idea is that the classes are mapped to {0, 255} for binary cases
-        # {0, 85, 170, 255} for 4 classes
-        # {0, 51, 102, 153, 204, 255} for 6 classes
-        # Very sketchy but that works here and that simplifies visualization
-        img = img / (255 / (K - 1)) if K != 5 else img / 63  # max <= 1
-        img = torch.tensor(img, dtype=torch.int64)[None, ...]  # Add one dimension to simulate batch
-        img = class2one_hot(img, K=K)
-        return img[0]
 
 def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
     # Networks and scheduler
@@ -119,24 +103,43 @@ def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
     B: int = datasets_params[args.dataset]['B']
     root_dir = Path("data") / args.dataset
 
+    img_transform = transforms.Compose([
+        lambda img: img.convert('L'),
+        lambda img: np.array(img)[np.newaxis, ...],
+        lambda nd: nd / 255,  # max <= 1
+        lambda nd: torch.tensor(nd, dtype=torch.float32)
+    ])
+
+    gt_transform = transforms.Compose([
+        lambda img: np.array(img)[...],
+        # The idea is that the classes are mapped to {0, 255} for binary cases
+        # {0, 85, 170, 255} for 4 classes
+        # {0, 51, 102, 153, 204, 255} for 6 classes
+        # Very sketchy but that works here and that simplifies visualization
+        lambda nd: nd / (255 / (K - 1)) if K != 5 else nd / 63,  # max <= 1
+        lambda nd: torch.tensor(nd, dtype=torch.int64)[None, ...],  # Add one dimension to simulate batch
+        lambda t: class2one_hot(t, K=K),
+        itemgetter(0)
+    ])
+
     train_set = SliceDataset('train',
                              root_dir,
                              img_transform=img_transform,
-                             gt_transform=partial(gt_transform, K),
+                             gt_transform=gt_transform,
                              debug=args.debug)
     train_loader = DataLoader(train_set,
                               batch_size=B,
-                              num_workers=5,
+                              num_workers=0,
                               shuffle=True)
 
     val_set = SliceDataset('val',
                            root_dir,
                            img_transform=img_transform,
-                           gt_transform=partial(gt_transform, K),
+                           gt_transform=gt_transform,
                            debug=args.debug)
     val_loader = DataLoader(val_set,
                             batch_size=B,
-                            num_workers=5,
+                            num_workers=0,
                             shuffle=False)
 
     args.dest.mkdir(parents=True, exist_ok=True)
@@ -161,12 +164,20 @@ def runTraining(args):
     # Updated setup function now returns the scheduler
     net, optimizer, scheduler, device, train_loader, val_loader, K = setup(args)
 
-    if args.mode == "full":
-        loss_fn = CrossEntropy(idk=list(range(K)))  # Supervise both background and foreground
-    elif args.mode in ["partial"] and args.dataset == 'SEGTHOR':
-        loss_fn = CrossEntropy(idk=[0, 1, 3, 4])  # Do not supervise the heart (class 2)
-    else:
-        raise ValueError(args.mode, args.dataset)
+    if args.loss_type == 'CrossEntropy':
+        if args.mode == "full":
+            loss_fn = CrossEntropy(idk=list(range(K)))  # Supervise both background and foreground
+        elif args.mode in ["partial"] and args.dataset == 'SEGTHOR':
+            loss_fn = CrossEntropy(idk=[0, 1, 3, 4])  # Do not supervise the heart (class 2)
+        else:
+            raise ValueError(args.mode, args.dataset)
+    elif args.loss_type == 'CombinedLoss':
+        if args.mode == "full":
+            loss_fn = CombinedLoss(idk=list(range(K)))  # Supervise both background and foreground
+        elif args.mode in ["partial"] and args.dataset == 'SEGTHOR':
+            loss_fn = CombinedLoss(idk=[0, 1, 3, 4])  # Do not supervise the heart (class 2)
+        else:
+            raise ValueError(args.mode, args.dataset)
 
     # Notice one has the length of the _loader_, and the other one of the _dataset_
     log_loss_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
@@ -295,6 +306,7 @@ def main():
     parser.add_argument('--epochs', default=20, type=int)
     parser.add_argument('--dataset', default='TOY2', choices=datasets_params.keys())
     parser.add_argument('--mode', default='full', choices=['partial', 'full'])
+    parser.add_argument('--loss-type', default='CrossEntropy', choices=['CrossEntropy', 'CombinedLoss'])
     parser.add_argument('--dest', type=Path, required=True,
                         help="Destination directory to save the results (predictions and weights).")
 
