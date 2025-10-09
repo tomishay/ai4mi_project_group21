@@ -42,6 +42,7 @@ from functools import partial
 from dataset import SliceDataset
 from ShallowNet import shallowCNN
 from ENet import ENet
+from ENet_enhance import ENet_enhance
 from utils import (Dcm,
                    class2one_hot,
                    probs2one_hot,
@@ -86,7 +87,14 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     K: int = datasets_params[args.dataset]['K']
     kernels: int = datasets_params[args.dataset]['kernels'] if 'kernels' in datasets_params[args.dataset] else 8
     factor: int = datasets_params[args.dataset]['factor'] if 'factor' in datasets_params[args.dataset] else 2
-    net = datasets_params[args.dataset]['net'](1, K, kernels=kernels, factor=factor)
+
+    if args.arch == 'enetx':
+        net = ENet_enhance(in_dim=1, out_dim=K,
+                           kernels=datasets_params[args.dataset].get('kernels', 8),
+                           factor=datasets_params[args.dataset].get('factor', 2),
+                           use_se=True, return_aux=True)
+    else:
+        net = datasets_params[args.dataset]['net'](1, K, kernels=kernels, factor=factor)
     net.init_weights()
     net.to(device)
 
@@ -177,7 +185,13 @@ def runTraining(args):
                     assert 0 <= img.min() and img.max() <= 1
                     B, _, W, H = img.shape
 
-                    pred_logits = net(img)
+                    # ==== forward (compatible with main output + two auxiliary heads) ====
+                    out = net(img)  # If it is ENet_enhance, out will be (logits, aux4, aux3)
+                    if isinstance(out, tuple):
+                        pred_logits, aux4, aux3 = out
+                    else:
+                        pred_logits, aux4, aux3 = out, None, None
+
                     pred_probs = F.softmax(1 * pred_logits, dim=1)  # 1 is the temperature parameter
 
                     # Metrics computation, not used for training
@@ -185,6 +199,13 @@ def runTraining(args):
                     log_dice[e, j:j + B, :] = dice_coef(pred_seg, gt)  # One DSC value per sample and per class
 
                     loss = loss_fn(pred_probs, gt)
+                    if aux4 is not None:
+                        aux4_probs = F.softmax(aux4, dim=1)
+                        loss = loss + 0.3 * loss_fn(aux4_probs, gt)
+
+                    if aux3 is not None:
+                        aux3_probs = F.softmax(aux3, dim=1)
+                        loss = loss + 0.2 * loss_fn(aux3_probs, gt)
                     log_loss[e, i] = loss.item()  # One loss value per batch (averaged in the loss)
 
                     if opt:  # Only for training
@@ -245,6 +266,8 @@ def main():
     parser.add_argument('--debug', action='store_true',
                         help="Keep only a fraction (10 samples) of the datasets, "
                              "to test the logics around epochs and logging easily.")
+    parser.add_argument('--arch', default='enet', choices=['enet', 'enetx'],
+                        help="enet (baseline), enetx (ENet_enhance)")
 
     args = parser.parse_args()
 
