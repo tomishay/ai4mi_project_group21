@@ -278,13 +278,13 @@ def runTraining(args):
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--epochs', default=25, type=int)
-    parser.add_argument('--dataset', default='SEGTHOR_CLEAN', choices=datasets_params.keys())
+    parser.add_argument('--epochs', default=20, type=int)
+    parser.add_argument('--dataset', default='TOY2', choices=datasets_params.keys())
     parser.add_argument('--mode', default='full', choices=['partial', 'full'])
-    parser.add_argument('--dest', type=Path, default="D:/Github Projects/ai4mi_project\data/results\SEGTHOR_CLEAN/aug4",
+    parser.add_argument('--dest', type=Path, required=True,
                         help="Destination directory to save the results (predictions and weights).")
 
-    parser.add_argument('--gpu', default=True,action='store_true')
+    parser.add_argument('--gpu', action='store_true')
     parser.add_argument('--debug', action='store_true',
                         help="Keep only a fraction (10 samples) of the datasets, "
                              "to test the logics around epochs and logging easily.")
