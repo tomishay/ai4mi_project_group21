@@ -24,17 +24,17 @@
 
 import argparse
 import warnings
+import json
+import math
 from typing import Any
 from pathlib import Path
 from pprint import pprint
-from operator import itemgetter
 from shutil import copytree, rmtree
 
 import torch
 import numpy as np
 import torch.nn.functional as F
 from torch import nn, Tensor
-from torchvision import transforms
 from torch.utils.data import DataLoader
 
 from functools import partial 
@@ -77,6 +77,13 @@ def gt_transform(K, img):
         img = class2one_hot(img, K=K)
         return img[0]
 
+
+def _tensor_mean_or_nan(tensor: Tensor) -> float:
+    if tensor.numel() == 0:
+        return float('nan')
+    return tensor.mean().item()
+
+
 def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     # Networks and scheduler
     gpu: bool = args.gpu and torch.cuda.is_available()
@@ -97,26 +104,34 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     B: int = datasets_params[args.dataset]['B']
     root_dir = Path("data") / args.dataset
 
-
-
-    train_set = SliceDataset('train',
-                             root_dir,
-                             img_transform=img_transform,
-                             gt_transform= partial(gt_transform, K),
-                             debug=args.debug)
+    if args.cv_folds and args.cv_folds > 1:
+        train_set, val_set, total_samples = SliceDataset.build_cv_fold(
+            root_dir=root_dir,
+            img_transform=img_transform,
+            gt_transform=partial(gt_transform, K),
+            folds=args.cv_folds,
+            fold_idx=args.cv_index,
+            seed=args.cv_seed,
+        )
+        total_patients = len(set(train_set.patient_ids) | set(val_set.patient_ids))
+        print(f">> Cross-validation fold {args.cv_index + 1}/{args.cv_folds}: {len(train_set)} train / {len(val_set)} val slices (patients: {len(train_set.patient_ids)} train / {len(val_set.patient_ids)} val, total={total_patients})")
+    else:
+        train_set = SliceDataset('train',
+                                 root_dir,
+                                 img_transform=img_transform,
+                                 gt_transform=partial(gt_transform, K))
+        val_set = SliceDataset('val',
+                               root_dir,
+                               img_transform=img_transform,
+                               gt_transform=partial(gt_transform, K))
     train_loader = DataLoader(train_set,
                               batch_size=B,
-                              num_workers=5,
+                              num_workers=4,
                               shuffle=True)
 
-    val_set = SliceDataset('val',
-                           root_dir,
-                           img_transform=img_transform,
-                           gt_transform=partial(gt_transform, K),
-                           debug=args.debug)
     val_loader = DataLoader(val_set,
                             batch_size=B,
-                            num_workers=5,
+                            num_workers=4,
                             shuffle=False)
 
     args.dest.mkdir(parents=True, exist_ok=True)
@@ -141,7 +156,8 @@ def runTraining(args):
     log_loss_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
     log_dice_val: Tensor = torch.zeros((args.epochs, len(val_loader.dataset), K))
 
-    best_dice: float = 0
+    best_dice: float = 0.0
+    best_epoch: int = -1
 
     for e in range(args.epochs):
         for m in ['train', 'val']:
@@ -215,11 +231,13 @@ def runTraining(args):
         np.save(args.dest / "loss_val.npy", log_loss_val)
         np.save(args.dest / "dice_val.npy", log_dice_val)
 
-        current_dice: float = log_dice_val[e, :, 1:].mean().item()
-        if current_dice > best_dice:
-            message = f">>> Improved dice at epoch {e}: {best_dice:05.3f}->{current_dice:05.3f} DSC"
+        current_dice: float = _tensor_mean_or_nan(log_dice_val[e, :, 1:])
+        if not math.isnan(current_dice) and current_dice > best_dice:
+            previous_best = best_dice if best_epoch >= 0 else 0.0
+            message = f">>> Improved dice at epoch {e}: {previous_best:05.3f}->{current_dice:05.3f} DSC"
             print(message)
             best_dice = current_dice
+            best_epoch = e
             with open(args.dest / "best_epoch.txt", 'w') as f:
                 f.write(message)
 
@@ -230,6 +248,83 @@ def runTraining(args):
 
             torch.save(net, args.dest / "bestmodel.pkl")
             torch.save(net.state_dict(), args.dest / "bestweights.pt")
+
+    final_epoch_idx = max(args.epochs - 1, 0)
+    final_val_dice = _tensor_mean_or_nan(log_dice_val[final_epoch_idx, :, 1:])
+    final_val_loss = _tensor_mean_or_nan(log_loss_val[final_epoch_idx])
+
+    train_dataset = train_loader.dataset
+    val_dataset = val_loader.dataset
+    train_patients = list(getattr(train_dataset, "patient_ids", []))
+    val_patients = list(getattr(val_dataset, "patient_ids", []))
+
+    summary = {
+        "fold_index": getattr(args, "cv_index", None),
+        "dest": args.dest,
+        "best_epoch": best_epoch if best_epoch >= 0 else None,
+        "best_dice": float(best_dice if best_epoch >= 0 else float('nan')),
+        "final_val_dice": final_val_dice,
+        "final_val_loss": final_val_loss,
+        "epochs": args.epochs,
+        "train_samples": len(train_dataset),
+        "val_samples": len(val_dataset),
+        "train_patient_count": len(train_patients),
+        "val_patient_count": len(val_patients),
+        "train_patients": train_patients,
+        "val_patients": val_patients,
+    }
+
+    return summary
+
+def summarize_crossval_runs(base_dest: Path, summaries: list[dict[str, Any]]) -> None:
+    if not summaries:
+        return
+
+    metric_keys = ['best_dice', 'final_val_dice', 'final_val_loss']
+    aggregated: dict[str, dict[str, float]] = {}
+    for key in metric_keys:
+        values: list[float] = []
+        for summary in summaries:
+            value = summary.get(key)
+            if value is None:
+                continue
+            value = float(value)
+            if math.isnan(value):
+                continue
+            values.append(value)
+        if values:
+            aggregated[key] = {
+                'mean': float(np.mean(values)),
+                'std': float(np.std(values)),
+            }
+        else:
+            aggregated[key] = {
+                'mean': float('nan'),
+                'std': float('nan'),
+            }
+
+    serialised = []
+    for summary in summaries:
+        serial = dict(summary)
+        if 'dest' in serial:
+            serial['dest'] = str(serial['dest'])
+        serialised.append(serial)
+
+    base_dest.mkdir(parents=True, exist_ok=True)
+    summary_path = base_dest / 'cv_summary.json'
+    payload = {'fold_results': serialised, 'aggregated': aggregated}
+    summary_path.write_text(json.dumps(payload, indent=2))
+
+    print('>>> Cross-validation summary')
+    for metric, stats in aggregated.items():
+        mean = stats['mean']
+        std = stats['std']
+        if math.isnan(mean):
+            print(f"    {metric}: mean=nan std=nan (insufficient data)")
+        else:
+            print(f"    {metric}: mean={mean:0.4f} std={std:0.4f}")
+    print(f"    Saved summary to {summary_path}")
+
 
 
 def main():
@@ -242,15 +337,49 @@ def main():
                         help="Destination directory to save the results (predictions and weights).")
 
     parser.add_argument('--gpu', action='store_true')
-    parser.add_argument('--debug', action='store_true',
-                        help="Keep only a fraction (10 samples) of the datasets, "
-                             "to test the logics around epochs and logging easily.")
+    parser.add_argument('--cv-folds', type=int, default=0,
+                        help="Number of folds for cross-validation; set >1 to enable.")
+    parser.add_argument('--cv-index', type=int, default=0,
+                        help="Fold index to train when cross-validation is enabled.")
+    parser.add_argument('--cv-run-all', action='store_true', default=True,
+                        help="Train sequentially on every fold when cross-validation is enabled.")
+    parser.add_argument('--cv-seed', type=int, default=42,
+                        help="Random seed used to shuffle samples before fold splits.")
 
     args = parser.parse_args()
 
-    pprint(args)
+    if args.cv_folds < 0:
+        raise ValueError("--cv-folds must be >= 0")
 
-    runTraining(args)
+    use_crossval = args.cv_folds and args.cv_folds > 1
+    if args.cv_run_all and not use_crossval:
+        warnings.warn("--cv-run-all ignored because --cv-folds <= 1")
+
+    base_dest = args.dest
+
+    if use_crossval:
+        if args.cv_run_all:
+            summaries: list[dict[str, Any]] = []
+            for fold_idx in range(args.cv_folds):
+                fold_args = argparse.Namespace(**vars(args))
+                fold_args.cv_index = fold_idx
+                fold_args.cv_run_all = False
+                fold_args.dest = base_dest / f"fold{fold_idx:02d}"
+                pprint(fold_args)
+                summary = runTraining(fold_args)
+                if summary:
+                    summaries.append(summary)
+            summarize_crossval_runs(base_dest, summaries)
+        else:
+            if not (0 <= args.cv_index < args.cv_folds):
+                raise ValueError(f"--cv-index must be in [0, {args.cv_folds - 1}] when cross-validation is enabled")
+            args.dest = base_dest / f"fold{args.cv_index:02d}"
+            pprint(args)
+            runTraining(args)
+    else:
+        args.dest = base_dest
+        pprint(args)
+        runTraining(args)
 
 
 if __name__ == '__main__':
