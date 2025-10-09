@@ -70,7 +70,6 @@ datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, '
 
 
 def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
-    # Networks and scheduler
     gpu: bool = args.gpu and torch.cuda.is_available()
     device = torch.device("cuda") if gpu else torch.device("cpu")
     print(f">> Picked {device} to run experiments")
@@ -85,7 +84,6 @@ def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
     # --- Optimizer selection ---
     lr = 0.0005
     optimizer_type = args.optimizer if hasattr(args, 'optimizer') else 'adamw'
-
     if optimizer_type == 'adamw':
         optimizer = AdamW(net.parameters(), lr=lr, betas=(0.9, 0.999))
     elif optimizer_type == 'adam':
@@ -100,49 +98,45 @@ def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_type}")
 
-    # Dataset part
+    # Dataset setup
     B: int = datasets_params[args.dataset]['B']
     root_dir = Path("data") / args.dataset
 
     img_transform = transforms.Compose([
         lambda img: img.convert('L'),
         lambda img: np.array(img)[np.newaxis, ...],
-        lambda nd: nd / 255,  # max <= 1
+        lambda nd: nd / 255,
         lambda nd: torch.tensor(nd, dtype=torch.float32)
     ])
 
     gt_transform = transforms.Compose([
         lambda img: np.array(img)[...],
-        # The idea is that the classes are mapped to {0, 255} for binary cases
-        # {0, 85, 170, 255} for 4 classes
-        # {0, 51, 102, 153, 204, 255} for 6 classes
-        # Very sketchy but that works here and that simplifies visualization
-        lambda nd: nd / (255 / (K - 1)) if K != 5 else nd / 63,  # max <= 1
-        lambda nd: torch.tensor(nd, dtype=torch.int64)[None, ...],  # Add one dimension to simulate batch
+        lambda nd: nd / (255 / (K - 1)) if K != 5 else nd / 63,
+        lambda nd: torch.tensor(nd, dtype=torch.int64)[None, ...],
         lambda t: class2one_hot(t, K=K),
         itemgetter(0)
     ])
 
-    # build augmenter (train only)\
+    # --- Augmentation config ---
     if args.aug == 'online':
         aug_cfg = AugConfig2D(
             rot_deg=8.0, shear_deg=5.0, translate=0.010, p_rot90=0.10,
-            p_roi_focus=0.60, small_class_indices=(0, 2),  # 食管 + 气管
+            p_roi_focus=0.60, small_class_indices=(0, 2),
             p_elastic=0.20, elastic_sigma=8.0, elastic_alpha=1.2
         )
         aug = OnlineAugment2D(aug_cfg)
     else:
         aug = None
 
-    # pass augmenter to train dataset; keep val clean
+    # --- Build datasets and loaders ---
     train_set = SliceDataset('train', root_dir,
                              img_transform=img_transform,
-                             gt_transform=partial(gt_transform, K),
+                             gt_transform=gt_transform,
                              debug=args.debug,
                              augment=aug)
     val_set = SliceDataset('val', root_dir,
                            img_transform=img_transform,
-                           gt_transform=partial(gt_transform, K),
+                           gt_transform=gt_transform,
                            debug=args.debug,
                            augment=None)
 
@@ -150,18 +144,15 @@ def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
                               batch_size=B,
                               num_workers=0,
                               shuffle=True)
-    
     val_loader = DataLoader(val_set,
                             batch_size=B,
                             num_workers=0,
                             shuffle=False)
 
-    args.dest.mkdir(parents=True, exist_ok=True)
-
-    # --- OneCycleLR Scheduler ---
+    # --- Scheduler ---
     scheduler = OneCycleLR(
         optimizer,
-        max_lr=lr * 10,       
+        max_lr=lr * 10,
         steps_per_epoch=len(train_loader),
         epochs=args.epochs,
         pct_start=0.3,
@@ -170,7 +161,9 @@ def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
         final_div_factor=100
     )
 
+    args.dest.mkdir(parents=True, exist_ok=True)
     return (net, optimizer, scheduler, device, train_loader, val_loader, K)
+
 
 
 def runTraining(args):
