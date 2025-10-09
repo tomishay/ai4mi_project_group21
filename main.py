@@ -57,7 +57,7 @@ from utils import (Dcm,
                    tqdm_,
                    dice_coef,
                    save_images)
-
+from vit_seg import TinyViTSeg
 from losses import (CrossEntropy)
 from new_losses import (CombinedLoss)
 from augment import OnlineAugment2D, AugConfig2D
@@ -84,8 +84,15 @@ def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
                            kernels=datasets_params[args.dataset].get('kernels', 8),
                            factor=datasets_params[args.dataset].get('factor', 2),
                            use_se=True, return_aux=True)
+        
+    elif args.arch == 'vit':
+        net = TinyViTSeg(in_dim=1, out_dim=K,
+                         embed_dim=192, depth=6, heads=6, patch=16, drop=0.0)
     else:
         net = datasets_params[args.dataset]['net'](1, K, kernels=kernels, factor=factor)
+
+    net.init_weights()
+    net.to(device)
     net.init_weights()
     net.to(device)
 
@@ -371,8 +378,9 @@ def main():
     parser.add_argument('--n_runs', default=1, type=int,
                     help="Number of times to repeat the training run for statistical comparison.")
     
-    parser.add_argument('--arch', default='enet', choices=['enet', 'enetx'],
+    parser.add_argument('--arch', default='enet', choices=['enet', 'enetx', 'vit'],
                         help="enet (baseline), enetx (ENet_enhance)")
+
 
     parser.add_argument('--aug', default='online', choices=['none', 'online'],
                         help="online augmentation for training set")
