@@ -49,7 +49,7 @@ from utils import (Dcm,
                    tqdm_,
                    dice_coef,
                    save_images)
-
+from vit_seg import TinyViTSeg
 from losses import (CrossEntropy)
 
 datasets_params: dict[str, dict[str, Any]] = {}
@@ -86,7 +86,16 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     K: int = datasets_params[args.dataset]['K']
     kernels: int = datasets_params[args.dataset]['kernels'] if 'kernels' in datasets_params[args.dataset] else 8
     factor: int = datasets_params[args.dataset]['factor'] if 'factor' in datasets_params[args.dataset] else 2
-    net = datasets_params[args.dataset]['net'](1, K, kernels=kernels, factor=factor)
+
+    # select architecture
+    if args.arch == 'vit':
+        net = TinyViTSeg(in_dim=1, out_dim=K,
+                         embed_dim=192, depth=6, heads=6, patch=16, drop=0.0)
+    else:
+        net = datasets_params[args.dataset]['net'](1, K, kernels=kernels, factor=factor)
+
+    net.init_weights()
+    net.to(device)
     net.init_weights()
     net.to(device)
 
@@ -245,6 +254,9 @@ def main():
     parser.add_argument('--debug', action='store_true',
                         help="Keep only a fraction (10 samples) of the datasets, "
                              "to test the logics around epochs and logging easily.")
+    parser.add_argument('--arch', default='enet', choices=['enet', 'vit'],
+                        help="enet (baseline), or vit")
+
 
     args = parser.parse_args()
 
