@@ -374,7 +374,7 @@ def main():
     parser.add_argument('--arch', nargs='+', default=['enet'],
                         choices=['enet', 'enetx', 'vit'],
                         help="One or more architectures to try.")
-    parser.add_argument('--aug', nargs='+', default=['online'],
+    parser.add_argument('--aug', nargs='+', default=['none'],
                         choices=['none', 'online'],
                         help="One or more augmentation modes to try.")
 
