@@ -183,7 +183,6 @@ def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
 
 def runTraining(args):
     print(f">>> Setting up to train on {args.dataset} with {args.mode} using {args.optimizer} optimizer")
-    # Updated setup function now returns the scheduler
     net, optimizer, scheduler, device, train_loader, val_loader, K = setup(args)
 
     if args.loss_type == 'CrossEntropy':
@@ -201,7 +200,6 @@ def runTraining(args):
         else:
             raise ValueError(args.mode, args.dataset)
 
-    # Notice one has the length of the _loader_, and the other one of the _dataset_
     log_loss_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
     log_dice_tra: Tensor = torch.zeros((args.epochs, len(train_loader.dataset), K))
     log_loss_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
@@ -362,7 +360,7 @@ def main():
     parser.add_argument('--epochs', default=20, type=int)
     parser.add_argument('--dataset', default='TOY2', choices=datasets_params.keys())
     parser.add_argument('--mode', default='full', choices=['partial', 'full'])
-    parser.add_argument('--loss-type', default='CrossEntropy', choices=['CrossEntropy', 'CombinedLoss'])
+    parser.add_argument('--loss_type', default='CrossEntropy', choices=['CrossEntropy', 'CombinedLoss'])
     parser.add_argument('--dest', type=Path, required=True,
                         help="Destination directory to save the results (predictions and weights).")
 
@@ -386,6 +384,9 @@ def main():
                         help="online augmentation for training set")
     args = parser.parse_args()
 
+    # Keep the original destination from the command line
+    orig_dest = args.dest
+
     pprint(args)
 
     for run_idx in range(args.n_runs):
@@ -393,15 +394,17 @@ def main():
         print(f" Run {run_idx + 1}/{args.n_runs} ")
         print(f"============================")
 
-        # Create a subfolder per run
-        run_dest = args.dest / f"run_{run_idx+1}"
+        # Create a subfolder path using the original destination
+        run_dest = orig_dest / f"run_{run_idx+1}"
         run_dest.mkdir(parents=True, exist_ok=True)
+        
+        # Create a copy of the arguments for this run
+        run_args = argparse.Namespace(**vars(args))
 
-        # Pass updated destination to each run
-        args.dest = run_dest
+        # Update only the destination in the copy
+        run_args.dest = run_dest
 
-        runTraining(args)
-
+        runTraining(run_args)
 
 
 if __name__ == '__main__':
