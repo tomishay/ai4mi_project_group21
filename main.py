@@ -61,6 +61,7 @@ from vit_seg import TinyViTSeg
 from losses import (CrossEntropy)
 from new_losses import (CombinedLoss)
 from augment import OnlineAugment2D, AugConfig2D
+from preprocessing_2d import run_preprocess_slices
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
@@ -68,6 +69,7 @@ datasets_params: dict[str, dict[str, Any]] = {}
 datasets_params["TOY2"] = {'K': 2, 'net': shallowCNN, 'B': 2, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_CLEAN_preproc"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 
 
 def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
@@ -378,6 +380,17 @@ def main():
     parser.add_argument('--aug', nargs='+', default=['none'],
                         choices=['none', 'online'],
                         help="One or more augmentation modes to try.")
+    
+    parser.add_argument( "--do_norm", action="store_true",)
+    parser.add_argument("--norm_lo", type=float, default=0.5)
+    parser.add_argument("--norm_hi", type=float, default=99.5)
+    parser.add_argument("--do_median", action="store_true")
+    parser.add_argument("--median_size", type=int, default=3)
+    parser.add_argument("--do_clahe", action="store_true")
+    parser.add_argument("--clahe_clip", type=float, default=4.0)
+    parser.add_argument("--clahe_grid", type=int, default=8)
+    parser.add_argument('--preproc', action='store_true')
+    
     parser.add_argument('--context', type=int, default=1,
                         help="Context size for the 25D dataset.")
     
@@ -386,6 +399,35 @@ def main():
 
     orig_dest = args.dest
     pprint(args)
+
+    if args.preproc:
+        src_root = Path(f"data/{args.dataset}")
+        preproc_root = Path(f"data/{args.dataset}_preproc")
+
+        if preproc_root.exists():
+            print(f"\n>>> Preprocessed dataset already exists: {preproc_root}")
+            args.dataset = preproc_root.name
+        else:
+            print(f"\n>>> Running preprocessing on: {src_root}")
+            out_root = run_preprocess_slices(
+                src_root=src_root,
+                do_norm=args.do_norm,
+                norm_lo=args.norm_lo,
+                norm_hi=args.norm_hi,
+                do_median=args.do_median,
+                median_size=args.median_size,
+                do_clahe=args.do_clahe,
+                clahe_clip=args.clahe_clip,
+                clahe_grid=args.clahe_grid
+            )
+
+            # switch dataset
+            if args.dataset.upper() == "SEGTHOR_CLEAN":
+                args.dataset = out_root.name  # e.g. "SEGTHOR_CLEAN_preproc"
+                print(f">>> Using preprocessed dataset: {args.dataset}")
+
+    # Generate all combinations of variable-length args
+    from itertools import product
 
     loss_types = args.loss_type
     optimizers = args.optimizer
