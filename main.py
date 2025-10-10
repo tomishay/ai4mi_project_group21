@@ -61,6 +61,7 @@ from vit_seg import TinyViTSeg
 from losses import (CrossEntropy)
 from new_losses import (CombinedLoss)
 from augment import OnlineAugment2D, AugConfig2D
+from preprocessing_2d import run_preprocess_slices
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
@@ -377,11 +378,41 @@ def main():
     parser.add_argument('--aug', nargs='+', default=['none'],
                         choices=['none', 'online'],
                         help="One or more augmentation modes to try.")
+    parser.add_argument( "--do_norm", action="store_true",)
+    parser.add_argument("--norm_lo", type=float, default=0.5)
+    parser.add_argument("--norm_hi", type=float, default=99.5)
+    parser.add_argument("--do_median", action="store_true")
+    parser.add_argument("--median_size", type=int, default=3)
+    parser.add_argument("--do_clahe", action="store_true")
+    parser.add_argument("--clahe_clip", type=float, default=4.0)
+    parser.add_argument("--clahe_grid", type=int, default=8)
+    parser.add_argument('--preproc', action='store_true')
+
 
     args = parser.parse_args()
 
     orig_dest = args.dest
     pprint(args)
+
+    if args.preproc:
+        src_root = Path(f"data/{args.dataset}")
+        print(f"\n>>> Running preprocessing on: {src_root}")
+        out_root = run_preprocess_slices(
+            src_root=src_root,
+            do_norm=args.do_norm,
+            norm_lo=args.norm_lo,
+            norm_hi=args.norm_hi,
+            do_median=args.do_median,
+            median_size=args.median_size,
+            do_clahe=args.do_clahe,
+            clahe_clip=args.clahe_clip,
+            clahe_grid=args.clahe_grid
+        )
+        
+        # switch dataset
+        if args.dataset.upper() == "SEGTHOR_CLEAN":
+            args.dataset = out_root.name 
+            print(f">>> Using preprocessed dataset: {args.dataset}")
 
     # Generate all combinations of variable-length args
     from itertools import product
