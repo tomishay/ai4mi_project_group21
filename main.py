@@ -69,6 +69,7 @@ datasets_params: dict[str, dict[str, Any]] = {}
 datasets_params["TOY2"] = {'K': 2, 'net': shallowCNN, 'B': 2, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_CLEAN_preproc"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 
 
 def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
@@ -388,11 +389,11 @@ def main():
     parser.add_argument("--clahe_grid", type=int, default=8)
     parser.add_argument('--preproc', action='store_true')
 
-
     args = parser.parse_args()
 
     orig_dest = args.dest
     pprint(args)
+
 
     if args.preproc:
         src_root = Path(f"data/{args.dataset}")
@@ -411,7 +412,7 @@ def main():
         
         # switch dataset
         if args.dataset.upper() == "SEGTHOR_CLEAN":
-            args.dataset = out_root.name 
+            args.dataset = out_root.name  # bv. "SEGTHOR_CLEAN_preproc"
             print(f">>> Using preprocessed dataset: {args.dataset}")
 
     # Generate all combinations of variable-length args
