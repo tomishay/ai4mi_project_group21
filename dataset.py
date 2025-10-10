@@ -23,7 +23,7 @@
 # SOFTWARE.
 
 from pathlib import Path
-from typing import Callable, Union
+from typing import Callable, Union, Optional
 
 from torch import Tensor
 from PIL import Image
@@ -65,12 +65,12 @@ def make_patient_to_indices(files: list[tuple[Path, Path | None]]) -> dict[str, 
 
 class SliceDataset(Dataset):
     def __init__(self, subset, root_dir, img_transform=None,
-                 gt_transform=None, augment=False, equalize=False, debug=False, context=None):
+                 gt_transform=None, augment=None, equalize=False, debug=False, context=None):
         assert context % 2 == 1, f"Context must be odd or None but got {context=}"
         self.root_dir: str = root_dir
         self.img_transform: Callable = img_transform
         self.gt_transform: Callable = gt_transform
-        self.augmentation: bool = augment
+        self.augmentation: Optional[Callable] = augment
         self.equalize: bool = equalize
 
         self.test_mode: bool = subset == 'test'
@@ -113,17 +113,26 @@ class SliceDataset(Dataset):
                 for i in neighbour_global
             ]
         # stack into a single tensor of shape (C, H, W)
-        
         images = torch.cat(img_tensors, dim=0)
         data_dict = {"images": images, "stems": img_path.stem}
-
+        
         if not self.test_mode:
             gt: Tensor = self.gt_transform(Image.open(gt_path))
 
             _, W, H = images.shape
             K, _, _ = gt.shape
             assert gt.shape == (K, W, H)
+            
+            if self.augmentation is not None:
+                images_aug, gt_aug = self.augmentation(images, gt)
+                data_dict["images"] = images_aug
+                data_dict["gts"] = gt_aug
+             else:
+                data_dict["gts"] = gt
 
-            data_dict["gts"] = gt
+              
+        
+
+
         return data_dict
 

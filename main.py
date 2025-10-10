@@ -30,6 +30,7 @@ from pprint import pprint
 from operator import itemgetter
 from shutil import copytree, rmtree
 
+import csv
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -37,11 +38,18 @@ from torch import nn, Tensor
 from torchvision import transforms
 from torch.utils.data import DataLoader
 
-from functools import partial 
+from functools import partial
+
+from torch.optim import AdamW, SGD, Adam
+from torch.optim.lr_scheduler import OneCycleLR
+from lion_pytorch import Lion
+
+# ---------------------------------------------
 
 from dataset import SliceDataset
 from ShallowNet import shallowCNN
 from ENet import ENet
+from ENet_enhance import ENet_enhance
 from utils import (Dcm,
                    class2one_hot,
                    probs2one_hot,
@@ -49,8 +57,10 @@ from utils import (Dcm,
                    tqdm_,
                    dice_coef,
                    save_images)
-
+from vit_seg import TinyViTSeg
 from losses import (CrossEntropy)
+from new_losses import (CombinedLoss)
+from augment import OnlineAugment2D, AugConfig2D
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
@@ -59,83 +69,138 @@ datasets_params["TOY2"] = {'K': 2, 'net': shallowCNN, 'B': 2, 'kernels': 8, 'fac
 datasets_params["SEGTHOR"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 
-def img_transform(img):
-        img = img.convert('L')
-        img = np.array(img)[np.newaxis, ...]
-        img = img / 255  # max <= 1
-        img = torch.tensor(img, dtype=torch.float32)
-        return img
 
-def gt_transform(K, img):
-        img = np.array(img)[...]
-        # The idea is that the classes are mapped to {0, 255} for binary cases
-        # {0, 85, 170, 255} for 4 classes
-        # {0, 51, 102, 153, 204, 255} for 6 classes
-        # Very sketchy but that works here and that simplifies visualization
-        img = img / (255 / (K - 1)) if K != 5 else img / 63  # max <= 1
-        img = torch.tensor(img, dtype=torch.int64)[None, ...]  # Add one dimension to simulate batch
-        img = class2one_hot(img, K=K)
-        return img[0]
-
-def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
-    # Networks and scheduler
+def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
     gpu: bool = args.gpu and torch.cuda.is_available()
     device = torch.device("cuda") if gpu else torch.device("cpu")
     print(f">> Picked {device} to run experiments")
 
     K: int = datasets_params[args.dataset]['K']
     kernels: int = datasets_params[args.dataset]['kernels'] if 'kernels' in datasets_params[args.dataset] else 8
-    factor: int = datasets_params[args.dataset]['factor'] if 'factor' in datasets_params[args.dataset] else 2
-    net = datasets_params[args.dataset]['net'](args.context, K, kernels=kernels, factor=factor)
+    factor: int = datasets_params[args.dataset]['factor'] if 'factor' in datasets_params[args.dataset] else 
+    if args.arch == 'enetx':
+        net = ENet_enhance(in_dim=args.context, out_dim=K,
+                           kernels=datasets_params[args.dataset].get('kernels', 8),
+                           factor=datasets_params[args.dataset].get('factor', 2),
+                           use_se=True, return_aux=True)
+        
+    elif args.arch == 'vit':
+        net = TinyViTSeg(in_dim=args.context, out_dim=K,
+                         embed_dim=192, depth=6, heads=6, patch=16, drop=0.0)
+    else:
+        net = datasets_params[args.dataset]['net'](args.context, K, kernels=kernels, factor=factor)
+
+
     net.init_weights()
     net.to(device)
 
+    # --- Optimizer selection ---
     lr = 0.0005
-    optimizer = torch.optim.Adam(net.parameters(), lr=lr, betas=(0.9, 0.999))
+    optimizer_type = args.optimizer if hasattr(args, 'optimizer') else 'adamw'
+    if optimizer_type == 'adamw':
+        optimizer = AdamW(net.parameters(), lr=lr, betas=(0.9, 0.999))
+    elif optimizer_type == 'adam':
+        optimizer = Adam(net.parameters(), lr=lr, betas=(0.9, 0.999))
+    elif optimizer_type == 'radam':
+        from torch.optim import RAdam
+        optimizer = RAdam(net.parameters(), lr=lr)
+    elif optimizer_type == 'sgd':
+        optimizer = SGD(net.parameters(), lr=0.01, momentum=0.9, nesterov=True)
+    elif optimizer_type == 'lion':
+        optimizer = Lion(net.parameters(), lr=lr)
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_type}")
 
-    # Dataset part
+    # Dataset setup
     B: int = datasets_params[args.dataset]['B']
     root_dir = Path("data") / args.dataset
 
+    img_transform = transforms.Compose([
+        lambda img: img.convert('L'),
+        lambda img: np.array(img)[np.newaxis, ...],
+        lambda nd: nd / 255,
+        lambda nd: torch.tensor(nd, dtype=torch.float32)
+    ])
 
+    gt_transform = transforms.Compose([
+        lambda img: np.array(img)[...],
+        lambda nd: nd / (255 / (K - 1)) if K != 5 else nd / 63,
+        lambda nd: torch.tensor(nd, dtype=torch.int64)[None, ...],
+        lambda t: class2one_hot(t, K=K),
+        itemgetter(0)
+    ])
 
-    train_set = SliceDataset('train',
-                             root_dir,
+    # --- Augmentation config ---
+    if args.aug == 'online':
+        aug_cfg = AugConfig2D(
+            rot_deg=8.0, shear_deg=5.0, translate=0.010, p_rot90=0.10,
+            p_roi_focus=0.60, small_class_indices=(0, 2),
+            p_elastic=0.20, elastic_sigma=8.0, elastic_alpha=1.2
+        )
+        aug = OnlineAugment2D(aug_cfg)
+    else:
+        aug = None
+
+    # --- Build datasets and loaders ---
+    train_set = SliceDataset('train', root_dir,
                              img_transform=img_transform,
                              gt_transform= partial(gt_transform, K),
                              debug=args.debug,
+                             augment=aug
                              context=args.context)
-    train_loader = DataLoader(train_set,
-                              batch_size=B,
-                              num_workers=5,
-                              shuffle=True)
 
-    val_set = SliceDataset('val',
-                           root_dir,
+    val_set = SliceDataset('val', root_dir,
                            img_transform=img_transform,
                            gt_transform=partial(gt_transform, K),
                            debug=args.debug,
+                           augment=None,
                            context=args.context)
+
+    train_loader = DataLoader(train_set,
+                              batch_size=B,
+                              num_workers=0,
+                              shuffle=True)
     val_loader = DataLoader(val_set,
                             batch_size=B,
-                            num_workers=5,
+                            num_workers=0,
                             shuffle=False)
 
-    args.dest.mkdir(parents=True, exist_ok=True)
+    # --- Scheduler ---
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=lr * 10,
+        steps_per_epoch=len(train_loader),
+        epochs=args.epochs,
+        pct_start=0.3,
+        anneal_strategy='cos',
+        div_factor=10,
+        final_div_factor=100
+    )
 
-    return (net, optimizer, device, train_loader, val_loader, K)
+    args.dest.mkdir(parents=True, exist_ok=True)
+    return (net, optimizer, scheduler, device, train_loader, val_loader, K)
+
 
 
 def runTraining(args):
-    print(f">>> Setting up to train on {args.dataset} with {args.mode}")
-    net, optimizer, device, train_loader, val_loader, K = setup(args)
-    
-    if args.mode == "full":
-        loss_fn = CrossEntropy(idk=list(range(K)))  # Supervise both background and foreground
-    elif args.mode in ["partial"] and args.dataset == 'SEGTHOR':
-        loss_fn = CrossEntropy(idk=[0, 1, 3, 4])  # Do not supervise the heart (class 2)
-    else:
-        raise ValueError(args.mode, args.dataset)
+    print(f">>> Setting up to train on {args.dataset} with {args.mode} using {args.optimizer} optimizer")
+    # Updated setup function now returns the scheduler
+    net, optimizer, scheduler, device, train_loader, val_loader, K = setup(args)
+
+    if args.loss_type == 'CrossEntropy':
+        if args.mode == "full":
+            loss_fn = CrossEntropy(idk=list(range(K)))  # Supervise both background and foreground
+        elif args.mode in ["partial"] and args.dataset == 'SEGTHOR':
+            loss_fn = CrossEntropy(idk=[0, 1, 3, 4])  # Do not supervise the heart (class 2)
+        else:
+            raise ValueError(args.mode, args.dataset)
+    elif args.loss_type == 'CombinedLoss':
+        if args.mode == "full":
+            loss_fn = CombinedLoss(idk=list(range(K)))  # Supervise both background and foreground
+        elif args.mode in ["partial"] and args.dataset == 'SEGTHOR':
+            loss_fn = CombinedLoss(idk=[0, 1, 3, 4])  # Do not supervise the heart (class 2)
+        else:
+            raise ValueError(args.mode, args.dataset)
 
     # Notice one has the length of the _loader_, and the other one of the _dataset_
     log_loss_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
@@ -146,11 +211,31 @@ def runTraining(args):
     best_dice: float = 0
 
     for e in range(args.epochs):
+        aug_ref = getattr(train_loader.dataset, "augment", None)
+        if args.aug == 'online' and aug_ref is not None:
+            if e < 8:
+                aug_ref.cfg.p_roi_focus = 0.65
+                aug_ref.cfg.rot_deg = 6.0
+                aug_ref.cfg.shear_deg = 4.0
+                aug_ref.cfg.translate = 0.008
+                aug_ref.cfg.p_rot90 = 0.0
+                aug_ref.cfg.p_elastic = 0.0
+            else:
+                aug_ref.cfg.p_roi_focus = 0.60
+                aug_ref.cfg.rot_deg = 8.0
+                aug_ref.cfg.shear_deg = 5.0
+                aug_ref.cfg.translate = 0.010
+                aug_ref.cfg.p_rot90 = 0.10
+                aug_ref.cfg.p_elastic = 0.20
+                aug_ref.cfg.elastic_sigma = 8.0
+                aug_ref.cfg.elastic_alpha = 1.2
+
         for m in ['train', 'val']:
             match m:
                 case 'train':
                     net.train()
                     opt = optimizer
+                    sched = scheduler # Use the scheduler
                     cm = Dcm
                     desc = f">> Training   ({e: 4d})"
                     loader = train_loader
@@ -159,6 +244,7 @@ def runTraining(args):
                 case 'val':
                     net.eval()
                     opt = None
+                    sched = None # No scheduler update on validation
                     cm = torch.no_grad
                     desc = f">> Validation ({e: 4d})"
                     loader = val_loader
@@ -179,19 +265,35 @@ def runTraining(args):
                     assert 0 <= img.min() and img.max() <= 1
                     B, _, W, H = img.shape
 
-                    pred_logits = net(img)
+                    # ==== forward (compatible with main output + two auxiliary heads) ====
+                    out = net(img)  # If it is ENet_enhance, out will be (logits, aux4, aux3)
+                    if isinstance(out, tuple):
+                        pred_logits, aux4, aux3 = out
+                    else:
+                        pred_logits, aux4, aux3 = out, None, None
+
                     pred_probs = F.softmax(1 * pred_logits, dim=1)  # 1 is the temperature parameter
 
                     # Metrics computation, not used for training
-                    pred_seg = probs2one_hot(pred_probs)
-                    log_dice[e, j:j + B, :] = dice_coef(pred_seg, gt)  # One DSC value per sample and per class
+                    pred_seg = probs2one_hot(pred_probs) # float {0,1}
+                    pred_seg_bool = pred_seg.bool()  # -> bool for bitwise &
+                    gt_bool = gt.bool()  # keep a bool copy for Dice
+                    log_dice[e, j:j + B, :] = dice_coef(pred_seg_bool, gt_bool)  # One DSC value per sample and per class
 
                     loss = loss_fn(pred_probs, gt)
+                    if aux4 is not None:
+                        aux4_probs = F.softmax(aux4, dim=1)
+                        loss = loss + 0.3 * loss_fn(aux4_probs, gt)
+
+                    if aux3 is not None:
+                        aux3_probs = F.softmax(aux3, dim=1)
+                        loss = loss + 0.2 * loss_fn(aux3_probs, gt)
                     log_loss[e, i] = loss.item()  # One loss value per batch (averaged in the loss)
 
                     if opt:  # Only for training
                         loss.backward()
                         opt.step()
+                        sched.step() # Step the scheduler after the optimizer step
 
                     if m == 'val':
                         with warnings.catch_warnings():
@@ -205,11 +307,33 @@ def runTraining(args):
                     j += B  # Keep in mind that _in theory_, each batch might have a different size
                     # For the DSC average: do not take the background class (0) into account:
                     postfix_dict: dict[str, str] = {"Dice": f"{log_dice[e, :j, 1:].mean():05.3f}",
-                                                    "Loss": f"{log_loss[e, :i + 1].mean():5.2e}"}
+                                                     "Loss": f"{log_loss[e, :i + 1].mean():5.2e}"}
                     if K > 2:
                         postfix_dict |= {f"Dice-{k}": f"{log_dice[e, :j, k].mean():05.3f}"
                                          for k in range(1, K)}
                     tq_iter.set_postfix(postfix_dict)
+        
+        csv_file = args.dest / "training_metrics.csv"
+
+    with open(csv_file, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        # Header
+        header = ["epoch", "train_loss", "val_loss", "train_dice", "val_dice"] + [f"train_dice_class{k}" for k in range(1, K)] + [f"val_dice_class{k}" for k in range(1, K)]
+        writer.writerow(header)
+
+        for e in range(args.epochs):
+            train_loss_mean = log_loss_tra[e].mean().item()
+            val_loss_mean = log_loss_val[e].mean().item()
+            train_dice_mean = log_dice_tra[e, :, 1:].mean().item()  # exclude background
+            val_dice_mean = log_dice_val[e, :, 1:].mean().item()
+            # Dice per class
+            train_dice_classes = [log_dice_tra[e, :, k].mean().item() for k in range(1, K)]
+            val_dice_classes = [log_dice_val[e, :, k].mean().item() for k in range(1, K)]
+
+            row = [e, train_loss_mean, val_loss_mean, train_dice_mean, val_dice_mean] + train_dice_classes + val_dice_classes
+            writer.writerow(row)
+
+        print(f">>> Metrics exported to {csv_file}")
 
         # I save it at each epochs, in case the code crashes or I decide to stop it early
         np.save(args.dest / "loss_tra.npy", log_loss_tra)
@@ -233,15 +357,19 @@ def runTraining(args):
             torch.save(net, args.dest / "bestmodel.pkl")
             torch.save(net.state_dict(), args.dest / "bestweights.pt")
 
-
 def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--epochs', default=20, type=int)
     parser.add_argument('--dataset', default='TOY2', choices=datasets_params.keys())
     parser.add_argument('--mode', default='full', choices=['partial', 'full'])
+    parser.add_argument('--loss-type', default='CrossEntropy', choices=['CrossEntropy', 'CombinedLoss'])
     parser.add_argument('--dest', type=Path, required=True,
                         help="Destination directory to save the results (predictions and weights).")
+
+    optimizer_choices = ['adam','adamw', 'radam', 'sgd', 'lion']
+    parser.add_argument('--optimizer', default='adam', choices=optimizer_choices,
+                        help="The optimizer to use for training.")
 
     parser.add_argument('--gpu', action='store_true')
     parser.add_argument('--debug', action='store_true',
@@ -249,11 +377,34 @@ def main():
                              "to test the logics around epochs and logging easily.")
     parser.add_argument('--context', type=int, default=1,
                         help="Context size for the 25D dataset.")
+    
+    parser.add_argument('--n_runs', default=1, type=int,
+                    help="Number of times to repeat the training run for statistical comparison.")
+    
+    parser.add_argument('--arch', default='enet', choices=['enet', 'enetx', 'vit'],
+                        help="enet (baseline), enetx (ENet_enhance)")
+
+
+    parser.add_argument('--aug', default='online', choices=['none', 'online'],
+                        help="online augmentation for training set")
     args = parser.parse_args()
 
     pprint(args)
 
-    runTraining(args)
+    for run_idx in range(args.n_runs):
+        print(f"\n============================")
+        print(f" Run {run_idx + 1}/{args.n_runs} ")
+        print(f"============================")
+
+        # Create a subfolder per run
+        run_dest = args.dest / f"run_{run_idx+1}"
+        run_dest.mkdir(parents=True, exist_ok=True)
+
+        # Pass updated destination to each run
+        args.dest = run_dest
+
+        runTraining(args)
+
 
 
 if __name__ == '__main__':
