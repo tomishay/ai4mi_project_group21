@@ -43,7 +43,7 @@ from functools import partial
 from torch.optim import AdamW, SGD, Adam
 from torch.optim.lr_scheduler import OneCycleLR
 from lion_pytorch import Lion
-
+from itertools import product
 # ---------------------------------------------
 
 from dataset import SliceDataset
@@ -382,9 +382,6 @@ def main():
 
     orig_dest = args.dest
     pprint(args)
-
-    # Generate all combinations of variable-length args
-    from itertools import product
 
     loss_types = args.loss_type
     optimizers = args.optimizer
