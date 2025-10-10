@@ -184,9 +184,12 @@ class ENet(nn.Module):
                 #                          conv_block)
 
                 # Initial operations
-                self.conv0 = nn.Conv2d(in_dim, K - 1, kernel_size=3, stride=2, padding=1)
-                self.maxpool0 = nn.MaxPool2d(2, return_indices=False, ceil_mode=False)
+                initial_channels: int = K - in_dim
+                if initial_channels <= 0:
+                        raise ValueError(f"Number of kernels ({K}) must exceed input channels ({in_dim}).")
 
+                self.conv0 = nn.Conv2d(in_dim, initial_channels, kernel_size=3, stride=2, padding=1)
+                self.maxpool0 = nn.MaxPool2d(2, return_indices=False, ceil_mode=False)
                 # Downsampling half
                 self.bottleneck1_0 = BottleNeckDownSampling(K, K * 4, F)
                 self.bottleneck1_1 = nn.Sequential(BottleNeck(K * 4, K * 4, F),
