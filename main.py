@@ -184,7 +184,6 @@ def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
 
 def runTraining(args):
     print(f">>> Setting up to train on {args.dataset} with {args.mode} using {args.optimizer} optimizer")
-    # Updated setup function now returns the scheduler
     net, optimizer, scheduler, device, train_loader, val_loader, K = setup(args)
 
     if args.loss_type == 'CrossEntropy':
@@ -202,7 +201,6 @@ def runTraining(args):
         else:
             raise ValueError(args.mode, args.dataset)
 
-    # Notice one has the length of the _loader_, and the other one of the _dataset_
     log_loss_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
     log_dice_tra: Tensor = torch.zeros((args.epochs, len(train_loader.dataset), K))
     log_loss_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
@@ -363,48 +361,67 @@ def main():
     parser.add_argument('--epochs', default=20, type=int)
     parser.add_argument('--dataset', default='TOY2', choices=datasets_params.keys())
     parser.add_argument('--mode', default='full', choices=['partial', 'full'])
-    parser.add_argument('--loss-type', default='CrossEntropy', choices=['CrossEntropy', 'CombinedLoss'])
+    parser.add_argument('--loss_type', nargs='+', default=['CrossEntropy'],
+                        choices=['CrossEntropy', 'CombinedLoss'],
+                        help="One or more loss types to try.")
     parser.add_argument('--dest', type=Path, required=True,
-                        help="Destination directory to save the results (predictions and weights).")
-
-    optimizer_choices = ['adam','adamw', 'radam', 'sgd', 'lion']
-    parser.add_argument('--optimizer', default='adam', choices=optimizer_choices,
-                        help="The optimizer to use for training.")
-
+                        help="Destination directory to save results.")
+    parser.add_argument('--optimizer', nargs='+', default=['adamw'],
+                        choices=['adam', 'adamw', 'radam', 'sgd', 'lion'],
+                        help="One or more optimizers to try.")
     parser.add_argument('--gpu', action='store_true')
-    parser.add_argument('--debug', action='store_true',
-                        help="Keep only a fraction (10 samples) of the datasets, "
-                             "to test the logics around epochs and logging easily.")
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--n_runs', default=1, type=int)
+    parser.add_argument('--arch', nargs='+', default=['enet'],
+                        choices=['enet', 'enetx', 'vit'],
+                        help="One or more architectures to try.")
+    parser.add_argument('--aug', nargs='+', default=['none'],
+                        choices=['none', 'online'],
+                        help="One or more augmentation modes to try.")
     parser.add_argument('--context', type=int, default=1,
                         help="Context size for the 25D dataset.")
     
-    parser.add_argument('--n_runs', default=1, type=int,
-                    help="Number of times to repeat the training run for statistical comparison.")
-    
-    parser.add_argument('--arch', default='enet', choices=['enet', 'enetx', 'vit'],
-                        help="enet (baseline), enetx (ENet_enhance)")
 
-
-    parser.add_argument('--aug', default='online', choices=['none', 'online'],
-                        help="online augmentation for training set")
     args = parser.parse_args()
 
+    orig_dest = args.dest
     pprint(args)
 
-    for run_idx in range(args.n_runs):
+    # Generate all combinations of variable-length args
+    from itertools import product
+
+    loss_types = args.loss_type
+    optimizers = args.optimizer
+    archs = args.arch
+    augs = args.aug
+    
+
+    combos = list(product(loss_types, optimizers, archs, augs))
+    print(f"\n>>> Running {len(combos)} combinations.")
+
+    for (loss_type, optimizer, arch, aug) in combos:
+        combo_name = f"{loss_type}_{optimizer}_{arch}_{aug}"
         print(f"\n============================")
-        print(f" Run {run_idx + 1}/{args.n_runs} ")
+        print(f" Running combination: {combo_name}")
         print(f"============================")
 
-        # Create a subfolder per run
-        run_dest = args.dest / f"run_{run_idx+1}"
-        run_dest.mkdir(parents=True, exist_ok=True)
+        combo_dest = orig_dest / combo_name
+        combo_dest.mkdir(parents=True, exist_ok=True)
 
-        # Pass updated destination to each run
-        args.dest = run_dest
+        for run_idx in range(args.n_runs):
+            print(f"\n--- Run {run_idx + 1}/{args.n_runs} for {combo_name} ---")
 
-        runTraining(args)
+            run_dest = combo_dest / f"run_{run_idx + 1}"
+            run_dest.mkdir(parents=True, exist_ok=True)
 
+            run_args = argparse.Namespace(**vars(args))
+            run_args.loss_type = loss_type
+            run_args.optimizer = optimizer
+            run_args.arch = arch
+            run_args.aug = aug
+            run_args.dest = run_dest
+
+            runTraining(run_args)
 
 
 if __name__ == '__main__':
