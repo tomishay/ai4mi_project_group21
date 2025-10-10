@@ -394,26 +394,31 @@ def main():
     orig_dest = args.dest
     pprint(args)
 
-
     if args.preproc:
         src_root = Path(f"data/{args.dataset}")
-        print(f"\n>>> Running preprocessing on: {src_root}")
-        out_root = run_preprocess_slices(
-            src_root=src_root,
-            do_norm=args.do_norm,
-            norm_lo=args.norm_lo,
-            norm_hi=args.norm_hi,
-            do_median=args.do_median,
-            median_size=args.median_size,
-            do_clahe=args.do_clahe,
-            clahe_clip=args.clahe_clip,
-            clahe_grid=args.clahe_grid
-        )
-        
-        # switch dataset
-        if args.dataset.upper() == "SEGTHOR_CLEAN":
-            args.dataset = out_root.name  # bv. "SEGTHOR_CLEAN_preproc"
-            print(f">>> Using preprocessed dataset: {args.dataset}")
+        preproc_root = Path(f"data/{args.dataset}_preproc")
+
+        if preproc_root.exists():
+            print(f"\n>>> Preprocessed dataset already exists: {preproc_root}")
+            args.dataset = preproc_root.name
+        else:
+            print(f"\n>>> Running preprocessing on: {src_root}")
+            out_root = run_preprocess_slices(
+                src_root=src_root,
+                do_norm=args.do_norm,
+                norm_lo=args.norm_lo,
+                norm_hi=args.norm_hi,
+                do_median=args.do_median,
+                median_size=args.median_size,
+                do_clahe=args.do_clahe,
+                clahe_clip=args.clahe_clip,
+                clahe_grid=args.clahe_grid
+            )
+
+            # switch dataset
+            if args.dataset.upper() == "SEGTHOR_CLEAN":
+                args.dataset = out_root.name  # e.g. "SEGTHOR_CLEAN_preproc"
+                print(f">>> Using preprocessed dataset: {args.dataset}")
 
     # Generate all combinations of variable-length args
     from itertools import product
