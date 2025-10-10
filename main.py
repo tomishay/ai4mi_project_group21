@@ -78,21 +78,19 @@ def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
     K: int = datasets_params[args.dataset]['K']
     kernels: int = datasets_params[args.dataset]['kernels'] if 'kernels' in datasets_params[args.dataset] else 8
     factor: int = datasets_params[args.dataset]['factor'] if 'factor' in datasets_params[args.dataset] else 2
-
     if args.arch == 'enetx':
-        net = ENet_enhance(in_dim=1, out_dim=K,
+        net = ENet_enhance(in_dim=args.context, out_dim=K,
                            kernels=datasets_params[args.dataset].get('kernels', 8),
                            factor=datasets_params[args.dataset].get('factor', 2),
                            use_se=True, return_aux=True)
         
     elif args.arch == 'vit':
-        net = TinyViTSeg(in_dim=1, out_dim=K,
+        net = TinyViTSeg(in_dim=args.context, out_dim=K,
                          embed_dim=192, depth=6, heads=6, patch=16, drop=0.0)
     else:
-        net = datasets_params[args.dataset]['net'](1, K, kernels=kernels, factor=factor)
+        net = datasets_params[args.dataset]['net'](args.context, K, kernels=kernels, factor=factor)
 
-    net.init_weights()
-    net.to(device)
+
     net.init_weights()
     net.to(device)
 
@@ -146,14 +144,17 @@ def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
     # --- Build datasets and loaders ---
     train_set = SliceDataset('train', root_dir,
                              img_transform=img_transform,
-                             gt_transform=gt_transform,
+                             gt_transform= gt_transform,
                              debug=args.debug,
-                             augment=aug)
+                             augment=aug,
+                             context=args.context)
+
     val_set = SliceDataset('val', root_dir,
                            img_transform=img_transform,
                            gt_transform=gt_transform,
                            debug=args.debug,
-                           augment=None)
+                           augment=None,
+                           context=args.context)
 
     train_loader = DataLoader(train_set,
                               batch_size=B,
@@ -377,6 +378,9 @@ def main():
     parser.add_argument('--aug', nargs='+', default=['none'],
                         choices=['none', 'online'],
                         help="One or more augmentation modes to try.")
+    parser.add_argument('--context', type=int, default=1,
+                        help="Context size for the 25D dataset.")
+    
 
     args = parser.parse_args()
 
@@ -387,6 +391,7 @@ def main():
     optimizers = args.optimizer
     archs = args.arch
     augs = args.aug
+    
 
     combos = list(product(loss_types, optimizers, archs, augs))
     print(f"\n>>> Running {len(combos)} combinations.")
