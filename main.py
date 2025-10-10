@@ -77,7 +77,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
 
     K: int = datasets_params[args.dataset]['K']
     kernels: int = datasets_params[args.dataset]['kernels'] if 'kernels' in datasets_params[args.dataset] else 8
-    factor: int = datasets_params[args.dataset]['factor'] if 'factor' in datasets_params[args.dataset] else 
+    factor: int = datasets_params[args.dataset]['factor'] if 'factor' in datasets_params[args.dataset] else 2
     if args.arch == 'enetx':
         net = ENet_enhance(in_dim=args.context, out_dim=K,
                            kernels=datasets_params[args.dataset].get('kernels', 8),
@@ -144,14 +144,14 @@ def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
     # --- Build datasets and loaders ---
     train_set = SliceDataset('train', root_dir,
                              img_transform=img_transform,
-                             gt_transform= partial(gt_transform, K),
+                             gt_transform= gt_transform,
                              debug=args.debug,
-                             augment=aug
+                             augment=aug,
                              context=args.context)
 
     val_set = SliceDataset('val', root_dir,
                            img_transform=img_transform,
-                           gt_transform=partial(gt_transform, K),
+                           gt_transform=gt_transform,
                            debug=args.debug,
                            augment=None,
                            context=args.context)

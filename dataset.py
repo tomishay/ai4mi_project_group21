@@ -127,7 +127,7 @@ class SliceDataset(Dataset):
                 images_aug, gt_aug = self.augmentation(images, gt)
                 data_dict["images"] = images_aug
                 data_dict["gts"] = gt_aug
-             else:
+            else:
                 data_dict["gts"] = gt
 
               

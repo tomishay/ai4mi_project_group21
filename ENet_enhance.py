@@ -194,7 +194,10 @@ class ENet_enhance(nn.Module):
         self.return_aux: bool = kwargs.get("return_aux", True)
 
         # Initial
-        self.conv0 = nn.Conv2d(in_dim, K - 1, kernel_size=3, stride=2, padding=1, bias=False)
+        initial_channels: int = K - in_dim
+        if initial_channels <= 0:
+            raise ValueError(f"Number of kernels ({K}) must exceed input channels ({in_dim}).")
+        self.conv0 = nn.Conv2d(in_dim, initial_channels, kernel_size=3, stride=2, padding=1, bias=False)
         self.maxpool0 = nn.MaxPool2d(2, return_indices=False, ceil_mode=False)
 
         # Down
