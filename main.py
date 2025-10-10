@@ -43,7 +43,7 @@ from functools import partial
 from torch.optim import AdamW, SGD, Adam
 from torch.optim.lr_scheduler import OneCycleLR
 from lion_pytorch import Lion
-
+from itertools import product
 # ---------------------------------------------
 
 from dataset import SliceDataset
