@@ -62,6 +62,7 @@ from losses import (CrossEntropy)
 from new_losses import (CombinedLoss)
 from augment import OnlineAugment2D, AugConfig2D
 from preprocessing_2d import run_preprocess_slices
+import pandas as pd
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
@@ -461,6 +462,59 @@ def main():
             run_args.dest = run_dest
 
             runTraining(run_args)
+
+    # Summarize results
+    results_dir = orig_dest
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_path = results_dir / "summary.csv"
+    summary_rows = []
+
+    # Iterate over all combinations and runs
+    for (loss_type, optimizer, arch, aug) in combos:
+        combo_name = f"{loss_type}_{optimizer}_{arch}_{aug}"
+        combo_dest = orig_dest / combo_name
+
+        run_metrics = []
+
+        for run_idx in range(args.n_runs):
+            run_dest = combo_dest / f"run_{run_idx + 1}"
+            csv_path = run_dest / "training_metrics.csv"
+
+            if csv_path.exists():
+                df = pd.read_csv(csv_path)
+                # Take last epoch values
+                last_epoch = df.iloc[-1]
+                run_metrics.append({
+                    "train_loss": last_epoch["train_loss"],
+                    "val_loss": last_epoch["val_loss"],
+                    "train_dice": last_epoch["train_dice"],
+                    "val_dice": last_epoch["val_dice"],
+                })
+            else:
+                print(f"Warning: Missing metrics file for {run_dest}")
+
+        if run_metrics:
+            # Compute averages across runs
+            avg_train_loss = np.mean([m["train_loss"] for m in run_metrics])
+            avg_val_loss = np.mean([m["val_loss"] for m in run_metrics])
+            avg_train_dice = np.mean([m["train_dice"] for m in run_metrics])
+            avg_val_dice = np.mean([m["val_dice"] for m in run_metrics])
+
+            summary_rows.append({
+                "combo_name": combo_name,
+                "train_loss": avg_train_loss,
+                "val_loss": avg_val_loss,
+                "train_dice": avg_train_dice,
+                "val_dice": avg_val_dice,
+            })
+
+    # Write to CSV
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_csv(summary_path, index=False)
+
+    print(f"\n>>> Summary saved to: {summary_path}")
+    print(summary_df)
 
 
 if __name__ == '__main__':
