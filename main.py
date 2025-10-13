@@ -62,6 +62,7 @@ from losses import CrossEntropy
 from new_losses import CombinedLoss
 from augment import OnlineAugment2D, AugConfig2D
 from preprocessing_2d import run_preprocess_slices
+from postprocessing_2d import cc2d_segthor
 
 
 datasets_params: dict[str, dict[str, Any]] = {}
@@ -312,12 +313,6 @@ def runTraining(args):
 
                     pred_probs = F.softmax(1 * pred_logits, dim=1)  # 1 is the temperature parameter
 
-                    # Metrics computation, not used for training
-                    pred_seg = probs2one_hot(pred_probs)  # float {0,1}
-                    pred_seg_bool = pred_seg.bool()  # -> bool for bitwise &
-                    gt_bool = gt.bool()  # keep a bool copy for Dice
-                    log_dice[e, j:j + B, :] = dice_coef(pred_seg_bool, gt_bool)  # One DSC value per sample and per class
-
                     loss = loss_fn(pred_probs, gt)
                     if aux4 is not None:
                         aux4_probs = F.softmax(aux4, dim=1)
@@ -338,10 +333,24 @@ def runTraining(args):
                         with warnings.catch_warnings():
                             warnings.filterwarnings('ignore', category=UserWarning)
                             predicted_class: Tensor = probs2class(pred_probs)
+
+                            if args.postproc:
+                                pc_np = predicted_class.detach().cpu().numpy()
+                                pc_np_pp = np.empty_like(pc_np)
+                                for b in range(pc_np.shape[0]):  # per slice in batch
+                                    pc_np_pp[b] = cc2d_segthor(pc_np[b], K=K)
+                                predicted_class = torch.from_numpy(pc_np_pp).to(predicted_class.device)
+
                             mult: int = 63 if K == 5 else (255 / (K - 1))
                             save_images(predicted_class * mult,
                                         data['stems'],
                                         args.dest / f"iter{e:03d}" / m)
+                            
+                    # Metrics computation, not used for training
+                    pred_seg = probs2one_hot(pred_probs)  # float {0,1}
+                    pred_seg_bool = pred_seg.bool()  # -> bool for bitwise &
+                    gt_bool = gt.bool()  # keep a bool copy for Dice
+                    log_dice[e, j:j + B, :] = dice_coef(pred_seg_bool, gt_bool)  # One DSC value per sample and per class
 
                     j += B  # Keep in mind that _in theory_, each batch might have a different size
                     # For the DSC average: do not take the background class (0) into account:
@@ -522,6 +531,14 @@ def main():
                         help="Train sequentially on every fold when cross-validation is enabled.")
     parser.add_argument('--cv-seed', type=int, default=42,
                         help="Random seed used to shuffle samples before fold splits.")
+    
+    parser.add_argument('--postproc', action='store_true')
+    parser.add_argument('--keep-k', type=int, default=1, 
+                        help="Keep largest k components per class (non-background).")
+    parser.add_argument('--min-size', type=int, default=0,
+                        help="Discard components smaller than this size (in pixels).")
+    parser.add_argument('--pp-connectivity', type=int, default=1,
+                        help="Connectivity for 2D CCA: 1 (4-connected) or 2 (8-connected).")
 
     args = parser.parse_args()
 
