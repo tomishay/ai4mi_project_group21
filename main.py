@@ -8,8 +8,8 @@
 # of this software and associated documentation files (the "Software"), to deal
 # in the Software without restriction, including without limitation the rights
 # to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
+# copies of the Software, and to permit persons to do so, subject to the
+# following conditions:
 
 # The above copyright notice and this permission notice shall be included in all
 # copies or substantial portions of the Software.
@@ -24,27 +24,27 @@
 
 import argparse
 import warnings
+import json
+import math
+import csv
 from typing import Any
 from pathlib import Path
 from pprint import pprint
 from operator import itemgetter
 from shutil import copytree, rmtree
 
-import csv
 import torch
 import numpy as np
+import pandas as pd
 import torch.nn.functional as F
 from torch import nn, Tensor
 from torchvision import transforms
 from torch.utils.data import DataLoader
 
-from functools import partial
-
 from torch.optim import AdamW, SGD, Adam
 from torch.optim.lr_scheduler import OneCycleLR
 from lion_pytorch import Lion
 from itertools import product
-# ---------------------------------------------
 
 from dataset import SliceDataset
 from ShallowNet import shallowCNN
@@ -58,11 +58,11 @@ from utils import (Dcm,
                    dice_coef,
                    save_images)
 from vit_seg import TinyViTSeg
-from losses import (CrossEntropy)
-from new_losses import (CombinedLoss)
+from losses import CrossEntropy
+from new_losses import CombinedLoss
 from augment import OnlineAugment2D, AugConfig2D
 from preprocessing_2d import run_preprocess_slices
-import pandas as pd
+
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
@@ -71,6 +71,12 @@ datasets_params["TOY2"] = {'K': 2, 'net': shallowCNN, 'B': 2, 'kernels': 8, 'fac
 datasets_params["SEGTHOR"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_CLEAN_preproc"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+
+
+def _tensor_mean_or_nan(tensor: Tensor) -> float:
+    if tensor.numel() == 0:
+        return float('nan')
+    return tensor.mean().item()
 
 
 def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
@@ -86,13 +92,12 @@ def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
                            kernels=datasets_params[args.dataset].get('kernels', 8),
                            factor=datasets_params[args.dataset].get('factor', 2),
                            use_se=True, return_aux=True)
-        
+
     elif args.arch == 'vit':
         net = TinyViTSeg(in_dim=args.context, out_dim=K,
                          embed_dim=192, depth=6, heads=6, patch=16, drop=0.0)
     else:
         net = datasets_params[args.dataset]['net'](args.context, K, kernels=kernels, factor=factor)
-
 
     net.init_weights()
     net.to(device)
@@ -144,75 +149,106 @@ def setup(args) -> tuple[nn.Module, Any, Any, Any, DataLoader, DataLoader, int]:
     else:
         aug = None
 
-    # --- Build datasets and loaders ---
-    train_set = SliceDataset('train', root_dir,
-                             img_transform=img_transform,
-                             gt_transform= gt_transform,
-                             debug=args.debug,
-                             augment=aug,
-                             context=args.context)
+    use_crossval = getattr(args, "cv_folds", 0) and args.cv_folds > 1
 
-    val_set = SliceDataset('val', root_dir,
-                           img_transform=img_transform,
-                           gt_transform=gt_transform,
-                           debug=args.debug,
-                           augment=None,
-                           context=args.context)
+    if use_crossval:
+        train_set, val_set, _ = SliceDataset.build_cv_fold(
+            root_dir=root_dir,
+            img_transform=img_transform,
+            gt_transform=gt_transform,
+            folds=args.cv_folds,
+            fold_idx=args.cv_index,
+            seed=args.cv_seed,
+            augment=None,
+            context=args.context,
+            debug=getattr(args, "debug", False)
+        )
+        train_set.augmentation = aug
+        val_set.augmentation = None
+        total_patients = len(set(train_set.patient_ids) | set(val_set.patient_ids))
+        print(f">> Cross-validation fold {args.cv_index + 1}/{args.cv_folds}: {len(train_set)} train / {len(val_set)} val slices (patients: {len(train_set.patient_ids)} train / {len(val_set.patient_ids)} val, total={total_patients})")
+    else:
+        train_set = SliceDataset('train',
+                                 root_dir,
+                                 img_transform=img_transform,
+                                 gt_transform=gt_transform,
+                                 debug=getattr(args, "debug", False),
+                                 augment=aug,
+                                 context=args.context)
+        val_set = SliceDataset('val',
+                               root_dir,
+                               img_transform=img_transform,
+                               gt_transform=gt_transform,
+                               debug=getattr(args, "debug", False),
+                               augment=None,
+                               context=args.context)
+
+    loader_workers = 4 if use_crossval else 0
 
     train_loader = DataLoader(train_set,
                               batch_size=B,
-                              num_workers=0,
+                              num_workers=loader_workers,
                               shuffle=True)
+
     val_loader = DataLoader(val_set,
                             batch_size=B,
-                            num_workers=0,
+                            num_workers=loader_workers,
                             shuffle=False)
 
     # --- Scheduler ---
-    scheduler = OneCycleLR(
-        optimizer,
-        max_lr=lr * 10,
-        steps_per_epoch=len(train_loader),
-        epochs=args.epochs,
-        pct_start=0.3,
-        anneal_strategy='cos',
-        div_factor=10,
-        final_div_factor=100
-    )
+    total_steps = len(train_loader) * max(int(args.epochs), 1)
+    if total_steps == 0:
+        scheduler = None
+    else:
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr=lr * 10,
+            total_steps=total_steps,
+            pct_start=0.3,
+            anneal_strategy='cos',
+            div_factor=10,
+            final_div_factor=100
+        )
 
     args.dest.mkdir(parents=True, exist_ok=True)
     return (net, optimizer, scheduler, device, train_loader, val_loader, K)
-
 
 
 def runTraining(args):
     print(f">>> Setting up to train on {args.dataset} with {args.mode} using {args.optimizer} optimizer")
     net, optimizer, scheduler, device, train_loader, val_loader, K = setup(args)
 
-    if args.loss_type == 'CrossEntropy':
+    loss_choice = args.loss_type[0] if isinstance(args.loss_type, (list, tuple)) else args.loss_type
+
+    if loss_choice == 'CrossEntropy':
         if args.mode == "full":
             loss_fn = CrossEntropy(idk=list(range(K)))  # Supervise both background and foreground
         elif args.mode in ["partial"] and args.dataset == 'SEGTHOR':
             loss_fn = CrossEntropy(idk=[0, 1, 3, 4])  # Do not supervise the heart (class 2)
         else:
             raise ValueError(args.mode, args.dataset)
-    elif args.loss_type == 'CombinedLoss':
+    elif loss_choice == 'CombinedLoss':
         if args.mode == "full":
             loss_fn = CombinedLoss(idk=list(range(K)))  # Supervise both background and foreground
         elif args.mode in ["partial"] and args.dataset == 'SEGTHOR':
             loss_fn = CombinedLoss(idk=[0, 1, 3, 4])  # Do not supervise the heart (class 2)
         else:
             raise ValueError(args.mode, args.dataset)
+    else:
+        raise ValueError(f"Unknown loss type: {loss_choice}")
 
     log_loss_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
     log_dice_tra: Tensor = torch.zeros((args.epochs, len(train_loader.dataset), K))
     log_loss_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
     log_dice_val: Tensor = torch.zeros((args.epochs, len(val_loader.dataset), K))
 
-    best_dice: float = 0
+    best_dice: float = 0.0
+    best_epoch: int = -1
 
     for e in range(args.epochs):
         aug_ref = getattr(train_loader.dataset, "augment", None)
+        if aug_ref is None:
+            aug_ref = getattr(train_loader.dataset, "augmentation", None)
         if args.aug == 'online' and aug_ref is not None:
             if e < 8:
                 aug_ref.cfg.p_roi_focus = 0.65
@@ -232,25 +268,26 @@ def runTraining(args):
                 aug_ref.cfg.elastic_alpha = 1.2
 
         for m in ['train', 'val']:
-            match m:
-                case 'train':
-                    net.train()
-                    opt = optimizer
-                    sched = scheduler # Use the scheduler
-                    cm = Dcm
-                    desc = f">> Training   ({e: 4d})"
-                    loader = train_loader
-                    log_loss = log_loss_tra
-                    log_dice = log_dice_tra
-                case 'val':
-                    net.eval()
-                    opt = None
-                    sched = None # No scheduler update on validation
-                    cm = torch.no_grad
-                    desc = f">> Validation ({e: 4d})"
-                    loader = val_loader
-                    log_loss = log_loss_val
-                    log_dice = log_dice_val
+            if m == 'train':
+                net.train()
+                opt = optimizer
+                sched = scheduler  # Use the scheduler
+                cm = Dcm
+                desc = f">> Training   ({e: 4d})"
+                loader = train_loader
+                log_loss = log_loss_tra
+                log_dice = log_dice_tra
+            elif m == 'val':
+                net.eval()
+                opt = None
+                sched = None  # No scheduler update on validation
+                cm = torch.no_grad
+                desc = f">> Validation ({e: 4d})"
+                loader = val_loader
+                log_loss = log_loss_val
+                log_dice = log_dice_val
+            else:
+                raise ValueError(f"Unknown phase {m}")
 
             with cm():  # Either dummy context manager, or the torch.no_grad for validation
                 j = 0
@@ -276,7 +313,7 @@ def runTraining(args):
                     pred_probs = F.softmax(1 * pred_logits, dim=1)  # 1 is the temperature parameter
 
                     # Metrics computation, not used for training
-                    pred_seg = probs2one_hot(pred_probs) # float {0,1}
+                    pred_seg = probs2one_hot(pred_probs)  # float {0,1}
                     pred_seg_bool = pred_seg.bool()  # -> bool for bitwise &
                     gt_bool = gt.bool()  # keep a bool copy for Dice
                     log_dice[e, j:j + B, :] = dice_coef(pred_seg_bool, gt_bool)  # One DSC value per sample and per class
@@ -294,7 +331,8 @@ def runTraining(args):
                     if opt:  # Only for training
                         loss.backward()
                         opt.step()
-                        sched.step() # Step the scheduler after the optimizer step
+                        if sched is not None:
+                            sched.step()  # Step the scheduler after the optimizer step
 
                     if m == 'val':
                         with warnings.catch_warnings():
@@ -313,8 +351,26 @@ def runTraining(args):
                         postfix_dict |= {f"Dice-{k}": f"{log_dice[e, :j, k].mean():05.3f}"
                                          for k in range(1, K)}
                     tq_iter.set_postfix(postfix_dict)
-        
-        csv_file = args.dest / "training_metrics.csv"
+
+        current_dice: float = _tensor_mean_or_nan(log_dice_val[e, :, 1:])
+        if not math.isnan(current_dice) and current_dice > best_dice:
+            previous_best = best_dice if best_epoch >= 0 else 0.0
+            message = f">>> Improved dice at epoch {e}: {previous_best:05.3f}->{current_dice:05.3f} DSC"
+            print(message)
+            best_dice = current_dice
+            best_epoch = e
+            with open(args.dest / "best_epoch.txt", 'w') as f:
+                f.write(message)
+
+            best_folder = args.dest / "best_epoch"
+            if best_folder.exists():
+                rmtree(best_folder)
+            copytree(args.dest / f"iter{e:03d}", Path(best_folder))
+
+            torch.save(net, args.dest / "bestmodel.pkl")
+            torch.save(net.state_dict(), args.dest / "bestweights.pt")
+
+    csv_file = args.dest / "training_metrics.csv"
 
     with open(csv_file, mode='w', newline='') as f:
         writer = csv.writer(f)
@@ -342,21 +398,84 @@ def runTraining(args):
         np.save(args.dest / "loss_val.npy", log_loss_val)
         np.save(args.dest / "dice_val.npy", log_dice_val)
 
-        current_dice: float = log_dice_val[e, :, 1:].mean().item()
-        if current_dice > best_dice:
-            message = f">>> Improved dice at epoch {e}: {best_dice:05.3f}->{current_dice:05.3f} DSC"
-            print(message)
-            best_dice = current_dice
-            with open(args.dest / "best_epoch.txt", 'w') as f:
-                f.write(message)
+    final_epoch_idx = max(args.epochs - 1, 0)
+    final_val_dice = _tensor_mean_or_nan(log_dice_val[final_epoch_idx, :, 1:])
+    final_val_loss = _tensor_mean_or_nan(log_loss_val[final_epoch_idx])
 
-            best_folder = args.dest / "best_epoch"
-            if best_folder.exists():
-                rmtree(best_folder)
-            copytree(args.dest / f"iter{e:03d}", Path(best_folder))
+    train_dataset = train_loader.dataset
+    val_dataset = val_loader.dataset
+    train_patients = list(getattr(train_dataset, "patient_ids", []))
+    val_patients = list(getattr(val_dataset, "patient_ids", []))
 
-            torch.save(net, args.dest / "bestmodel.pkl")
-            torch.save(net.state_dict(), args.dest / "bestweights.pt")
+    summary = {
+        "fold_index": getattr(args, "cv_index", None),
+        "dest": args.dest,
+        "best_epoch": best_epoch if best_epoch >= 0 else None,
+        "best_dice": float(best_dice if best_epoch >= 0 else float('nan')),
+        "final_val_dice": final_val_dice,
+        "final_val_loss": final_val_loss,
+        "epochs": args.epochs,
+        "train_samples": len(train_dataset),
+        "val_samples": len(val_dataset),
+        "train_patient_count": len(train_patients),
+        "val_patient_count": len(val_patients),
+        "train_patients": train_patients,
+        "val_patients": val_patients,
+    }
+
+    return summary
+
+
+def summarize_crossval_runs(base_dest: Path, summaries: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+    if not summaries:
+        return {}
+
+    metric_keys = ['best_dice', 'final_val_dice', 'final_val_loss']
+    aggregated: dict[str, dict[str, float]] = {}
+    for key in metric_keys:
+        values: list[float] = []
+        for summary in summaries:
+            value = summary.get(key)
+            if value is None:
+                continue
+            value = float(value)
+            if math.isnan(value):
+                continue
+            values.append(value)
+        if values:
+            aggregated[key] = {
+                'mean': float(np.mean(values)),
+                'std': float(np.std(values)) if len(values) > 1 else 0.0,
+            }
+        else:
+            aggregated[key] = {
+                'mean': float('nan'),
+                'std': float('nan'),
+            }
+
+    serialised = []
+    for summary in summaries:
+        serial = dict(summary)
+        if 'dest' in serial:
+            serial['dest'] = str(serial['dest'])
+        serialised.append(serial)
+
+    base_dest.mkdir(parents=True, exist_ok=True)
+    summary_path = base_dest / 'cv_summary.json'
+    payload = {'fold_results': serialised, 'aggregated': aggregated}
+    summary_path.write_text(json.dumps(payload, indent=2))
+
+    print('>>> Cross-validation summary')
+    for metric, stats in aggregated.items():
+        mean = stats['mean']
+        std = stats['std']
+        if math.isnan(mean):
+            print(f"    {metric}: mean=nan std=nan (insufficient data)")
+        else:
+            print(f"    {metric}: mean={mean:0.4f} std={std:0.4f}")
+    print(f"    Saved summary to {summary_path}")
+    return aggregated
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -381,8 +500,8 @@ def main():
     parser.add_argument('--aug', nargs='+', default=['none'],
                         choices=['none', 'online'],
                         help="One or more augmentation modes to try.")
-    
-    parser.add_argument( "--do_norm", action="store_true",)
+
+    parser.add_argument("--do_norm", action="store_true",)
     parser.add_argument("--norm_lo", type=float, default=0.5)
     parser.add_argument("--norm_hi", type=float, default=99.5)
     parser.add_argument("--do_median", action="store_true")
@@ -391,12 +510,29 @@ def main():
     parser.add_argument("--clahe_clip", type=float, default=4.0)
     parser.add_argument("--clahe_grid", type=int, default=8)
     parser.add_argument('--preproc', action='store_true')
-    
+
     parser.add_argument('--context', type=int, default=1,
                         help="Context size for the 25D dataset.")
-    
+
+    parser.add_argument('--cv-folds', type=int, default=0,
+                        help="Number of folds for cross-validation; set >1 to enable.")
+    parser.add_argument('--cv-index', type=int, default=0,
+                        help="Fold index to train when cross-validation is enabled.")
+    parser.add_argument('--cv-run-all', action='store_true',
+                        help="Train sequentially on every fold when cross-validation is enabled.")
+    parser.add_argument('--cv-seed', type=int, default=42,
+                        help="Random seed used to shuffle samples before fold splits.")
 
     args = parser.parse_args()
+
+    if isinstance(args.loss_type, str):
+        args.loss_type = [args.loss_type]
+    if isinstance(args.optimizer, str):
+        args.optimizer = [args.optimizer]
+    if isinstance(args.arch, str):
+        args.arch = [args.arch]
+    if isinstance(args.aug, str):
+        args.aug = [args.aug]
 
     orig_dest = args.dest
     pprint(args)
@@ -427,17 +563,79 @@ def main():
                 args.dataset = out_root.name  # e.g. "SEGTHOR_CLEAN_preproc"
                 print(f">>> Using preprocessed dataset: {args.dataset}")
 
-    # Generate all combinations of variable-length args
-    from itertools import product
+    if args.cv_folds < 0:
+        raise ValueError("--cv-folds must be >= 0")
+
+    use_crossval = args.cv_folds and args.cv_folds > 1
 
     loss_types = args.loss_type
     optimizers = args.optimizer
     archs = args.arch
     augs = args.aug
-    
 
     combos = list(product(loss_types, optimizers, archs, augs))
     print(f"\n>>> Running {len(combos)} combinations.")
+
+    if use_crossval:
+        if args.cv_run_all:
+            folds_to_run = list(range(args.cv_folds))
+        else:
+            if not (0 <= args.cv_index < args.cv_folds):
+                raise ValueError(f"--cv-index must be in [0, {args.cv_folds - 1}] when cross-validation is enabled")
+            folds_to_run = [args.cv_index]
+
+        cv_summary_rows = []
+        for (loss_type, optimizer, arch, aug) in combos:
+            combo_name = f"{loss_type}_{optimizer}_{arch}_{aug}"
+            print(f"\n============================")
+            print(f" Running combination: {combo_name}")
+            print(f"============================")
+
+            combo_dest = orig_dest / combo_name
+            combo_dest.mkdir(parents=True, exist_ok=True)
+
+            for run_idx in range(args.n_runs):
+                print(f"\n--- Run {run_idx + 1}/{args.n_runs} for {combo_name} ---")
+                run_dest = combo_dest / f"run_{run_idx + 1}"
+                run_dest.mkdir(parents=True, exist_ok=True)
+
+                fold_summaries: list[dict[str, Any]] = []
+                for fold_idx in folds_to_run:
+                    print(f"\n>>> Fold {fold_idx + 1}/{args.cv_folds}")
+                    fold_args = argparse.Namespace(**vars(args))
+                    fold_args.loss_type = loss_type
+                    fold_args.optimizer = optimizer
+                    fold_args.arch = arch
+                    fold_args.aug = aug
+                    fold_args.dest = run_dest / f"fold{fold_idx:02d}"
+                    fold_args.cv_index = fold_idx
+                    fold_args.cv_run_all = False
+                    summary = runTraining(fold_args)
+                    if summary:
+                        fold_summaries.append(summary)
+
+                aggregated = summarize_crossval_runs(run_dest, fold_summaries)
+                if aggregated:
+                    cv_summary_rows.append({
+                        "combo_name": combo_name,
+                        "run": run_idx + 1,
+                        "best_dice_mean": aggregated.get('best_dice', {}).get('mean', float('nan')),
+                        "best_dice_std": aggregated.get('best_dice', {}).get('std', float('nan')),
+                        "final_val_dice_mean": aggregated.get('final_val_dice', {}).get('mean', float('nan')),
+                        "final_val_dice_std": aggregated.get('final_val_dice', {}).get('std', float('nan')),
+                        "final_val_loss_mean": aggregated.get('final_val_loss', {}).get('mean', float('nan')),
+                        "final_val_loss_std": aggregated.get('final_val_loss', {}).get('std', float('nan')),
+                    })
+        if cv_summary_rows:
+            summary_df = pd.DataFrame(cv_summary_rows)
+            summary_path = orig_dest / "cv_summary.csv"
+            summary_df.to_csv(summary_path, index=False)
+            print(f"\n>>> Cross-validation summary saved to: {summary_path}")
+            print(summary_df)
+        return
+
+    # Non cross-validation path ----------------------------------------
+    summary_rows = []
 
     for (loss_type, optimizer, arch, aug) in combos:
         combo_name = f"{loss_type}_{optimizer}_{arch}_{aug}"
@@ -447,6 +645,8 @@ def main():
 
         combo_dest = orig_dest / combo_name
         combo_dest.mkdir(parents=True, exist_ok=True)
+
+        run_metrics = []
 
         for run_idx in range(args.n_runs):
             print(f"\n--- Run {run_idx + 1}/{args.n_runs} for {combo_name} ---")
@@ -463,27 +663,9 @@ def main():
 
             runTraining(run_args)
 
-    # Summarize results
-    results_dir = orig_dest
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    summary_path = results_dir / "summary.csv"
-    summary_rows = []
-
-    # Iterate over all combinations and runs
-    for (loss_type, optimizer, arch, aug) in combos:
-        combo_name = f"{loss_type}_{optimizer}_{arch}_{aug}"
-        combo_dest = orig_dest / combo_name
-
-        run_metrics = []
-
-        for run_idx in range(args.n_runs):
-            run_dest = combo_dest / f"run_{run_idx + 1}"
             csv_path = run_dest / "training_metrics.csv"
-
             if csv_path.exists():
                 df = pd.read_csv(csv_path)
-                # Take last epoch values
                 last_epoch = df.iloc[-1]
                 run_metrics.append({
                     "train_loss": last_epoch["train_loss"],
@@ -495,7 +677,6 @@ def main():
                 print(f"Warning: Missing metrics file for {run_dest}")
 
         if run_metrics:
-            # Compute averages across runs
             avg_train_loss = np.mean([m["train_loss"] for m in run_metrics])
             avg_val_loss = np.mean([m["val_loss"] for m in run_metrics])
             avg_train_dice = np.mean([m["train_dice"] for m in run_metrics])
@@ -509,12 +690,12 @@ def main():
                 "val_dice": avg_val_dice,
             })
 
-    # Write to CSV
-    summary_df = pd.DataFrame(summary_rows)
-    summary_df.to_csv(summary_path, index=False)
-
-    print(f"\n>>> Summary saved to: {summary_path}")
-    print(summary_df)
+    if summary_rows:
+        summary_df = pd.DataFrame(summary_rows)
+        summary_path = orig_dest / "summary.csv"
+        summary_df.to_csv(summary_path, index=False)
+        print(f"\n>>> Summary saved to: {summary_path}")
+        print(summary_df)
 
 
 if __name__ == '__main__':
